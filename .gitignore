@@ -1,0 +1,32 @@
+# Local & internal notes
+1.txt
+inspect-html.js
+*.backup
+*.bak
+交接文档.md
+
+# Node / npm
+node_modules/
+package-lock.json
+
+# Temporary & Log files
+*.log
+*.tmp
+*.swp
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Exported HTML dumps & assets
+*.htm
+*.html
+*_files/
