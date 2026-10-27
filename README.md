@@ -22,6 +22,8 @@ When using Google AI Studio with models outputting complex mathematics and struc
    Multi-line formulas embedded inside tight list items often fail to trigger the built-in KaTeX pass.
 5. **Mobile Horizontal Scrolling Guard**:
    Fixes the rubber-band bounce-back issue on mobile browsers (such as Firefox Android) when panning across ultra-wide equations.
+6. **Literal Dollar Signs (`$` / Currency Amounts) Misrendered as Math**:
+   When the model outputs dollar amounts (e.g., `($19.99/mo) and **Google AI Ultra** ($99.99/mo)`, `$2/$10`, etc.), the upstream Markdown engine can falsely pair them as inline math formulas, swallowing dollar signs, italicizing text, and breaking bold markdown. This script restores literal dollar amounts in place, seamlessly pairs trapped `**` markdown back to bold styles, and splits mixed currency/math expressions.
 
 ---
 
@@ -35,14 +37,6 @@ When using Google AI Studio with models outputting complex mathematics and struc
    - [Install google-aistudio-latex-markdown-fix.user.js](https://raw.githubusercontent.com/m1kuk1m/google-aistudio-latex-markdown-fix/main/google-aistudio-latex-markdown-fix.user.js)
 2. Tampermonkey will prompt you to confirm installation. Click **Install**.
 3. Open or refresh [Google AI Studio](https://aistudio.google.com/).
-
----
-
-## Known Limitations
-
-- **Literal Dollar Signs (`$` / Currency)**:
-  When the model outputs plain text dollar signs (e.g., `$50` or `100$`), the frontend parser may still mistakenly interpret them as LaTeX math delimiters.
-  > **Note**: This is an upstream parsing behavior of Google AI Studio's frontend markdown engine, and occurs identically in the official, unmodded web client even without this extension active.
 
 ---
 

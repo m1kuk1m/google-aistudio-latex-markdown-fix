@@ -22,6 +22,8 @@
    部分嵌入在紧凑列表中的多行 LaTeX 公式无法正常触发 KaTeX 渲染。
 5. **移动端长公式横向滚动回弹**：
    在手机浏览器（如 Firefox Android）上横向滑动查看超长公式时，虚拟滚动节点卸载引发的异常回弹问题。
+6. **纯文本美元符号（`$` / 货币金额）误渲染为公式**：
+   当模型在正文中输出美元价格（例如 `（$19.99/月）和 **Google AI Ultra**（$99.99/月起）`、`$2/$10` 等）时，官方 Markdown 解析器会因缺失闭合后禁数字校验而将其误配对为行内公式，导致符号吞噬、文字斜体紧缩以及内部加粗失效。本插件自动原位还原被误判的美元符号及普通文本，并联动加粗状态机恢复内部的 `**` 加粗样式，支持混排公式的智能拆分。
 
 ---
 
@@ -35,14 +37,6 @@
    - [安装 google-aistudio-latex-markdown-fix.user.js](https://raw.githubusercontent.com/m1kuk1m/google-aistudio-latex-markdown-fix/main/google-aistudio-latex-markdown-fix.user.js)
 2. 在 Tampermonkey 弹出的确认页面中点击 **“安装”**。
 3. 打开或刷新 [Google AI Studio](https://aistudio.google.com/) 页面即可生效。
-
----
-
-## 目前已知的缺陷与局限
-
-- **纯文本美元符号（`$` / 货币金额）误识别**：
-  当模型在正文中输出纯文本美元字符（例如 `$50`、`100$` 等金额）时，前端解析器仍可能将其误识别为 LaTeX 行内公式的起止符号。
-  > **说明**：该问题属于 Google AI Studio 官方前端 Markdown 解析器的固有上游行为，在未安装任何插件的原版页面中同样存在。
 
 ---
 

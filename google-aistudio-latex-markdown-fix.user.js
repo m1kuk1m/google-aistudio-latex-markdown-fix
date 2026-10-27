@@ -3,10 +3,10 @@
 // @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复
 // @name:ja      Google AI Studio 数式＆Markdownレンダリング修正
 // @namespace    https://github.com/m1kuk1m/google-aistudio-latex-markdown-fix
-// @version      1.0.0
-// @description  Fixes LaTeX table truncation, broken matrix pipes, streaming race conditions, and formatting glitches in Google AI Studio.
-// @description:zh-CN 修复 Google AI Studio 上的 Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖及排版渲染问题
-// @description:ja Google AI Studioにおける数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、各種レンダリングの不具合を修正します
+// @version      1.1.0
+// @description  Fixes LaTeX table truncation, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, and formatting glitches in Google AI Studio.
+// @description:zh-CN 修复 Google AI Studio 上的 Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式及排版渲染问题
+// @description:ja Google AI Studioにおける数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、各種装飾の不具合を修正します
 // @author       m1kuk1m
 // @match        https://aistudio.google.com/*
 // @require      https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js
@@ -66,9 +66,11 @@
         const begins = (line.match(/\\begin\{[^}]+\}/g) || []).length;
         const ends = (line.match(/\\end\{[^}]+\}/g) || []).length;
         if (begins !== ends) return false;
-        const withoutDouble = line.replace(/\$\$/g, '');
+        // 过滤独立美元货币金额（如 $2.00、**$4.00**），避免单列货币金额误导公式配对判断
+        const withoutCurrency = line.replace(/(?<!\\)\$\d+(?:[.,]\d+)*(?:\s*[kKmMbB万亿]|\/[a-zA-Z\u4e00-\u9fa5]+)?(?!\$)/g, '');
+        const withoutDouble = withoutCurrency.replace(/\$\$/g, '');
         const dollars = (withoutDouble.match(/(?<!\\)\$/g) || []).length;
-        if (dollars % 2 !== 0) return false;
+        if (dollars % 2 !== 0 && begins === 0) return false;
         return true;
     }
 
@@ -366,6 +368,10 @@
             if (!clone.contains(k)) return;
             const ann = k.querySelector('annotation[encoding="application/x-tex"]');
             const raw = ann ? ann.textContent.trim() : '';
+            if (k.hasAttribute('data-ms-unmath')) {
+                k.replaceWith(document.createTextNode('$' + raw + '$'));
+                return;
+            }
             k.replaceWith(document.createTextNode(raw));
         });
 
@@ -527,19 +533,35 @@
         const s = (rawContent || '').trim();
         if (!s) return;
 
-        const mathRe = /\$\$([\s\S]+?)\$\$|\$([^$]+?)\$/g;
+        // 匹配 $$...$$ 块级公式或 $...$ 行内公式（严格要求开启符右无空格、闭合符左无空格且后不紧跟数字）
+        const mathRe = /\$\$([\s\S]+?)\$\$|(?<!\\|\$)\$(?!\s)([\s\S]+?)(?<!\s|\\)\$(?!\$)/g;
         let lastIdx = 0;
         let match;
         let hasMath = false;
         const frag = document.createDocumentFragment();
 
         while ((match = mathRe.exec(s)) !== null) {
+            const isDisplay = match[1] !== undefined;
+            const inner = isDisplay ? match[1] : match[2];
+            const trimmedInner = inner.trim();
+
+            // 若为单美元符号，检查是否为货币误匹配（如输入 $1.00 / 输出 $5.00）
+            if (!isDisplay) {
+                const afterMatch = s.slice(match.index + match[0].length);
+                if (/^[0-9]/.test(afterMatch) || (/^[0-9]/.test(trimmedInner) && (
+                    /[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]/.test(trimmedInner) ||
+                    /\*\*/.test(trimmedInner) ||
+                    /\/(?:mo|month|yr|year|day|hr|hour|user|seat|token|tokens|1M|M|k)\b/i.test(trimmedInner)
+                ))) {
+                    continue;
+                }
+            }
+
             hasMath = true;
             if (match.index > lastIdx) {
                 frag.appendChild(document.createTextNode(s.slice(lastIdx, match.index)));
             }
-            const isDisplay = match[1] !== undefined;
-            const tex = restoreCommonMarkEatenLatexEscapes((isDisplay ? match[1] : match[2]).trim());
+            const tex = restoreCommonMarkEatenLatexEscapes(trimmedInner);
             const span = document.createElement('span');
             renderTexInto(span, tex, isDisplay, k);
             frag.appendChild(span);
@@ -560,6 +582,143 @@
     }
 
     // ==================== 5. 核心修复逻辑 ====================
+
+    // ==================== 5.05 修复被误渲染为公式的美元货币符号 (v1.1.0 新增) ====================
+    // 根因：AI Studio 官方前端 Markdown 解析器缺失 Pandoc 规范中“右闭合 $ 后方不能紧跟数字”的校验。
+    // 当模型输出形如 `（$19.99/月）和 **Google AI Ultra**（$99.99/月起）` 时，第一个 $（$19.99）符合开启规则，
+    // 第二个 $（（$99.99）因左侧紧挨中文全角左括号（无空格）被误判为闭合符，导致首尾 $ 被吞噬，
+    // 夹在中间的正文与 ** 加粗标记被塞进 <ms-katex class="inline"> 导致空格丢失（$GoogleAIUltra$）且加粗失效变成数学星号。
+    // 方案：
+    // 1. 原生 DOM 零破坏：保留 <ms-katex> 节点在 DOM 树中的真实引用（维持 Angular Ivy LView 索引），将其置为 inline 并隐藏内部原生 <pre>；
+    // 2. 智能分类与还原：识别纯货币对（恢复首尾 $ 与原始正文）及“货币+真公式”混排拆分还原；
+    // 3. 管道协同：将还原后的文本置入 <span data-ms-currency-restore="1">，允许后置的 fixBrokenBoldMarkdown 无缝扫描并将其中的 ** 加粗恢复为 <strong>。
+    function fixBrokenCurrencyMath() {
+        const k = getKaTeX();
+        const katexElements = document.querySelectorAll(
+            'ms-cmark-node ms-katex, .markdown-content ms-katex, ms-katex'
+        );
+        if (!katexElements || katexElements.length === 0) return;
+
+        function getNextImmediateText(node, blockContainer) {
+            let cur = node;
+            while (cur && cur !== blockContainer) {
+                let sib = cur.nextSibling;
+                while (sib) {
+                    if (sib.nodeType === 3) {
+                        const val = sib.nodeValue || '';
+                        if (val.length > 0) return val;
+                    } else if (sib.nodeType === 1) {
+                        if (!sib.hasAttribute('data-ms-currency-restore')) {
+                            const txt = sib.textContent || '';
+                            if (txt.length > 0) return txt;
+                        }
+                    }
+                    sib = sib.nextSibling;
+                }
+                cur = cur.parentNode;
+            }
+            return '';
+        }
+
+        katexElements.forEach((katexEl) => {
+            if (katexEl.classList.contains('display') || (katexEl.parentElement && katexEl.parentElement.classList.contains('display'))) {
+                return;
+            }
+
+            const ann = katexEl.querySelector('annotation[encoding="application/x-tex"]');
+            const rawTex = ann ? ann.textContent : '';
+            if (!rawTex) return;
+
+            // 若已处理过且内容未发生流式变动，直接跳过
+            if (katexEl.hasAttribute('data-ms-unmath')) {
+                if (katexEl._msUnmathRaw === rawTex && katexEl._msRestoreSpan && katexEl._msRestoreSpan.isConnected) {
+                    return;
+                }
+            }
+
+            const trimmed = rawTex.trim();
+            if (!/^[0-9]/.test(trimmed)) return;
+
+            const blockContainer = katexEl.closest('p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote') || katexEl.parentElement;
+            const nextText = getNextImmediateText(katexEl, blockContainer);
+
+            // 规则 1: 紧跟数字（Pandoc 黄金规则，闭合 $ 之后紧跟数字，100% 为第二个金额的前缀，如 $99.99）
+            const nextStartsWithDigit = /^[0-9]/.test(nextText);
+
+            // 规则 2: 去除合法 \text{...} 等数学文本命令后，内容含有非数学排版特征（CJK、全角标点、加粗标记、常见货币周期单位等）
+            const texWithoutTextCmds = trimmed.replace(/\\(?:text|mbox|textrm|textbf|textit|mathrm)\s*\{[^}]*\}/g, '');
+            const hasCJK = /[\u3400-\u9fff\uf900-\ufaff]/.test(texWithoutTextCmds);
+            const hasFullwidthPunct = /[\u3000-\u303f\uff00-\uffef—…·「」『』《》【】（）]/.test(texWithoutTextCmds);
+            const hasBoldMarker = /\*\*/.test(texWithoutTextCmds);
+            const hasCurrencyUnit = /\/(?:mo|month|yr|year|day|hr|hour|user|seat|token|tokens|1M|M|k)\b/i.test(texWithoutTextCmds);
+            const hasInnerDollar = /(?<!\\)\$/.test(texWithoutTextCmds);
+
+            const isCurrencyFalsePositive =
+                nextStartsWithDigit ||
+                hasCJK ||
+                hasFullwidthPunct ||
+                hasBoldMarker ||
+                hasCurrencyUnit ||
+                hasInnerDollar;
+
+            if (!isCurrencyFalsePositive) return;
+
+            // 若容器已有加粗状态，先还原加粗，待文本重置后再由加粗状态机统一重跑
+            if (blockContainer && typeof blockContainer._msBoldRestore === 'function' && blockContainer._msBoldState) {
+                blockContainer._msBoldRestore();
+            }
+
+            // 清理旧还原节点
+            if (katexEl._msRestoreSpan && katexEl._msRestoreSpan.parentNode === katexEl) {
+                katexEl._msRestoreSpan.remove();
+            }
+
+            // 标记 <ms-katex> 并隐藏内部 <pre>
+            katexEl.setAttribute('data-ms-unmath', '1');
+            katexEl.style.display = 'inline';
+            const pre = katexEl.querySelector('pre');
+            if (pre) pre.style.display = 'none';
+
+            // 检查是否为“货币 + 真公式”混排拆分场景（如：单价为 $19.99/月，满足 $n \ge 100 时打折）
+            let isMixed = false;
+            let part1 = '';
+            let part2 = '';
+            if (hasInnerDollar && !nextStartsWithDigit) {
+                const dollarIdx = trimmed.indexOf('$');
+                if (dollarIdx > 0) {
+                    const p1 = trimmed.slice(0, dollarIdx);
+                    const p2 = trimmed.slice(dollarIdx + 1);
+                    const p1NoCmds = p1.replace(/\\(?:text|mbox|textrm|textbf|textit|mathrm)\s*\{[^}]*\}/g, '');
+                    if (/[\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]/.test(p1NoCmds) || /\*\*/.test(p1NoCmds)) {
+                        isMixed = true;
+                        part1 = p1;
+                        part2 = p2;
+                    }
+                }
+            }
+
+            const restoreSpan = document.createElement('span');
+            restoreSpan.setAttribute('data-ms-currency-restore', '1');
+
+            if (isMixed) {
+                restoreSpan.appendChild(document.createTextNode('$' + part1));
+                if (k && part2.trim()) {
+                    const mathSpan = document.createElement('span');
+                    mathSpan.setAttribute('data-ms-math-seg', '1');
+                    renderTexInto(mathSpan, part2.trim(), false, k);
+                    restoreSpan.appendChild(mathSpan);
+                } else {
+                    restoreSpan.appendChild(document.createTextNode('$' + part2));
+                }
+            } else {
+                restoreSpan.appendChild(document.createTextNode('$' + rawTex + '$'));
+            }
+
+            katexEl.appendChild(restoreSpan);
+            katexEl._msRestoreSpan = restoreSpan;
+            katexEl._msUnmathRaw = rawTex;
+        });
+    }
 
     // 修复普通段落里崩坏的多行公式 (v6.6 流式防抢跑 + 原位局部精准替换版)
     // 根因定位：
@@ -605,6 +764,10 @@
                             continue;
                         }
                         const tag = child.tagName.toLowerCase();
+                        if (tag === 'ms-katex' && child.hasAttribute('data-ms-unmath')) {
+                            scan(child);
+                            continue;
+                        }
                         if (tag === 'ms-katex' || (child.classList && child.classList.contains('katex'))) {
                             katexNodes.push(child);
                             continue;
@@ -746,6 +909,10 @@
                             continue;
                         }
                         const tag = child.tagName.toLowerCase();
+                        if (tag === 'ms-katex' && child.hasAttribute('data-ms-unmath')) {
+                            buildStream(child);
+                            continue;
+                        }
                         if (tag === 'ms-katex' || (child.classList && child.classList.contains('katex'))) {
                             katexNodes.push(child);
                             const ann = child.querySelector('annotation[encoding="application/x-tex"]');
@@ -1329,6 +1496,7 @@
                 const walker = document.createTreeWalker(blockContainer, NodeFilter.SHOW_TEXT, null);
                 let node;
                 while ((node = walker.nextNode())) {
+                    if (node.parentElement && node.parentElement.closest('pre')) continue;
                     if (sub.contains(node)) {
                         reachedSub = true;
                         continue;
@@ -1401,6 +1569,10 @@
                         }
                         const tag = child.tagName.toLowerCase();
                         if (subBlockTags.has(tag)) continue;
+                        if (tag === 'ms-katex' && child.hasAttribute('data-ms-unmath')) {
+                            scan(child);
+                            continue;
+                        }
                         if (skipInlineTags.has(tag) || (child.classList && child.classList.contains('katex'))) continue;
                         if ((tag === 'strong' || tag === 'b') && !child.hasAttribute('data-fixed-bold')) {
                             nativeStrongs.push(child);
@@ -1518,6 +1690,10 @@
                         }
                         const tag = child.tagName.toLowerCase();
                         if (subBlockTags.has(tag)) continue;
+                        if (tag === 'ms-katex' && child.hasAttribute('data-ms-unmath')) {
+                            buildEvents(child);
+                            continue;
+                        }
                         if (skipInlineTags.has(tag) || (child.classList && child.classList.contains('katex'))) continue;
 
                         const isNativeStrong = (tag === 'strong' || tag === 'b') && !child.hasAttribute('data-fixed-bold');
@@ -1730,6 +1906,7 @@
     // ==================== 6. 统一执行与 DOM 监听调度 ====================
 
     function runAllFixes() {
+        fixBrokenCurrencyMath();
         fixBrokenParagraphs();
         fixBrokenTableRows();
         fixBrokenSubscriptMarkdown();
