@@ -3,7 +3,7 @@
 // @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复 (含防撤回/防截断)
 // @name:ja      Google AI Studio 数式＆Markdownレンダリング修正 (リトラクション防止)
 // @namespace    https://github.com/m1kuk1m/google-aistudio-latex-markdown-fix
-// @version      1.4.1
+// @version      1.4.2
 // @description  Fixes AI Studio output retraction and truncation, LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, and CJK punctuation formatting glitches in Google AI Studio.
 // @description:zh-CN 修复与防护 Google AI Studio 上的回答意外截断与敏感词整段撤回、Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆及 CJK 标点斜体窃取排版问题
 // @description:ja Google AI Studioにおける回答の意図しない切断・取り消し（リトラクション）の防止、数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合を修正します
@@ -24,15 +24,18 @@
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (typeof window !== 'undefined' ? window : globalThis);
 
     // ==================== 1. 全域防撤回与防截断保护系统 (Anti-Retraction & Truncation Engine) ====================
-    // 背景：AI Studio 在流式生成结束或检测到特定安全/异常码 (finishReason 处于黑名单 jIb 中) 时，
-    // 前端 lJb 会清空本轮所有 model chunk 并替换为 text: "" 的空块，甚至导致已输出的长文本直接被整段撤回蒸发；
-    // 本引擎在 Angular 数据状态层 (entities Map) 精准拦截该撤回过程，并将已生成的实质内容完整保留。
+    // 背景：AI Studio 在流式生成结束或检测到特定安全/异常码 (finishReason 处于黑名单 wNb/jIb 中) 时，
+    // 前端 AOb/lJb 会清空本轮所有 model chunk 并替换为 text: "" 的空块，甚至导致已输出的长文本和思考过程被整段撤回蒸发；
+    // 本引擎在双层架构中提供防护：
+    //   第 1 层（源头拦截）：拦截 Array.prototype.includes 签名守卫，引导 AOb/lJb 走原生保留分支（零开销保留原生 <ms-thought-chunk> 与正文）；
+    //   第 2 层（数据层兜底）：动态特征识别 finishReason 属性（不依赖 Closure Compiler 属性混淆名 v.Dl/v.Mm），在 Map.set/delete 拦截清空并复活内容。
 
-    // AI Studio 官方触发撤回的 finishReason 黑名单 (对应官方源码 jIb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17])
+    // AI Studio 官方触发撤回的 finishReason 黑名单 (对应官方源码 wNb/jIb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17])
     const RETRACT_FINISH_REASONS = new Set([3, 4, 5, 7, 8, 9, 11, 14, 15, 17]);
 
     // 用户主动操作时间戳（用于区分用户主动点击清空/删除/重试 与 系统的被动抽风撤回）
     let userActiveActionTs = 0;
+    const isUserInitiatedAction = () => (Date.now() - userActiveActionTs) < 1500;
     const markUserAction = (e) => {
         try {
             const target = e && e.target;
@@ -51,6 +54,44 @@
         window.addEventListener('pointerdown', markUserAction, true);
     }
 
+    // ---------------- 第 1 层：Array.prototype.includes 源头签名守卫 ----------------
+    // 在 AI Studio 打包核心中，11 个元素的错误码数组 [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17]（wNb/jIb）
+    // 唯一用途就是在 AOb/lJb 中执行 wNb.includes(g.finishReason)。
+    // 拦截该调用使其在非用户主动操作时返回 false，AI Studio 会原生走 else 分支，保留所有原生思考面板与正文！
+    const hookArrayPrototype = (targetProto) => {
+        if (!targetProto || targetProto._msHookedIncludes) return;
+        targetProto._msHookedIncludes = true;
+        const origIncludes = targetProto.includes;
+        targetProto.includes = function (searchElement, fromIndex) {
+            const res = origIncludes.apply(this, arguments);
+            if (!res) return false;
+            if (
+                typeof searchElement === 'number' &&
+                RETRACT_FINISH_REASONS.has(searchElement) &&
+                this.length === 11 &&
+                this[0] === 0 &&
+                this[1] === 3 &&
+                this[2] === 4 &&
+                this[10] === 17
+            ) {
+                if (!isUserInitiatedAction()) {
+                    try {
+                        console.info(`[AI Studio Fix] 🛡️ (第1层) 成功拦截 AOb/lJb 撤回判断 (finishReason: ${searchElement})，原生保留全部思考与正文块`);
+                    } catch (_) {}
+                    return false;
+                }
+            }
+            return res;
+        };
+    };
+    hookArrayPrototype(win.Array ? win.Array.prototype : (typeof Array !== 'undefined' ? Array.prototype : null));
+    if (typeof window !== 'undefined' && window !== win && window.Array && window.Array.prototype) {
+        hookArrayPrototype(window.Array.prototype);
+    }
+    if (typeof Array !== 'undefined' && Array.prototype) {
+        hookArrayPrototype(Array.prototype);
+    }
+
     // 影子快照池：记录所有 model 实体块的最新有效文本及部件快照
     const chunkSnapshotCache = new Map();
     // 救援池：暂存刚刚被 delete 的 model 块（键为 chunkId，值为快照与删除时间）
@@ -59,7 +100,7 @@
     function cleanExpiredSnapshots() {
         const now = Date.now();
         for (const [id, rec] of recentlyDeletedModelChunks.entries()) {
-            if (now - rec.deletedAt > 6000) {
+            if (now - rec.deletedAt > 8000) {
                 recentlyDeletedModelChunks.delete(id);
             }
         }
@@ -67,6 +108,29 @@
             const oldestKey = chunkSnapshotCache.keys().next().value;
             chunkSnapshotCache.delete(oldestKey);
         }
+    }
+
+    // 动态提取/设置 chunk 的结束元数据（兼容 Closure Compiler 混淆更新：旧版 v.Dl，新版 v.Mm，以及未来任意混淆名）
+    function getChunkFinishMeta(v) {
+        if (!v || typeof v !== 'object') return null;
+        if (v.Mm && (typeof v.Mm.finishReason !== 'undefined' || Array.isArray(v.Mm.safetyRatings))) return { key: 'Mm', meta: v.Mm };
+        if (v.Dl && (typeof v.Dl.finishReason !== 'undefined' || Array.isArray(v.Dl.safetyRatings))) return { key: 'Dl', meta: v.Dl };
+        for (const k of Object.keys(v)) {
+            const val = v[k];
+            if (val && typeof val === 'object' && !Array.isArray(val)) {
+                if (typeof val.finishReason !== 'undefined' || Array.isArray(val.safetyRatings)) {
+                    return { key: k, meta: val };
+                }
+            }
+        }
+        return null;
+    }
+
+    function setChunkFinishMeta(v, newProps) {
+        if (!v || typeof v !== 'object') return;
+        const current = getChunkFinishMeta(v);
+        const targetKey = current ? current.key : (v.Mm ? 'Mm' : 'Dl');
+        v[targetKey] = Object.assign({}, v[targetKey], newProps);
     }
 
     // 原始 Markdown 缓冲池与 Angular LView 映射存储 (弱引用避免内存泄漏)
@@ -80,7 +144,7 @@
         const origMapSet = targetMap.prototype.set;
         const origMapDelete = targetMap.prototype.delete;
 
-        // 拦截 delete: 当实体块被 lJb 或 WIb 删除时，迅速打入救援池与当前 Map 实例暂存
+        // 拦截 delete: 当实体块被 AOb/lJb 或 WIb 删除时，迅速打入救援池与当前 Map 实例暂存
         if (typeof origMapDelete === 'function' && !targetMap.prototype._msHookedDelete) {
             targetMap.prototype._msHookedDelete = true;
             targetMap.prototype.delete = function (k) {
@@ -89,9 +153,11 @@
                         const existing = this.get(k) || chunkSnapshotCache.get(k);
                         if (existing && existing.role === 'model') {
                             const text = typeof existing.text === 'string' ? existing.text : '';
-                            if (text.trim().length > 0 || existing.thought) {
+                            const isThought = !!(existing.thought || existing.Ul || existing.ln);
+                            if (text.length > 0 || isThought) {
                                 const record = {
-                                    chunk: Object.assign({}, existing, { text }),
+                                    id: k,
+                                    chunk: Object.assign({}, existing, { text, thought: isThought }),
                                     deletedAt: Date.now()
                                 };
                                 if (!this._msDeletedChunks) this._msDeletedChunks = [];
@@ -106,7 +172,7 @@
             };
         }
 
-        // 拦截 set: 维护快照、捕获 lJb 空块替换、捕获 WIb 覆写清空
+        // 拦截 set: 维护快照、捕获 lJb/AOb 空块替换、捕获 WIb/kOb 覆写清空
         if (typeof origMapSet === 'function' && !targetMap.prototype._msHookedSet) {
             targetMap.prototype._msHookedSet = true;
             targetMap.prototype.set = function (k, v) {
@@ -123,67 +189,86 @@
                 // 2. 防撤回核心数据层守卫
                 try {
                     if (v && typeof v === 'object' && v.role === 'model' && typeof k === 'string') {
-                        const rawText = typeof v.text === 'string' ? v.text : '';
-                        const hasSubstantiveText = rawText.trim().length > 0;
                         const prevSnapshot = chunkSnapshotCache.get(k);
-                        const isUserInitiated = (Date.now() - userActiveActionTs) < 1500;
 
-                        if (hasSubstantiveText) {
+                        // 性能极速通道：new Map(entities) 克隆时引用相等则 O(1) 立即返回
+                        if (prevSnapshot && prevSnapshot.lastRef === v) {
+                            return origMapSet.call(this, k, v);
+                        }
+
+                        const rawText = typeof v.text === 'string' ? v.text : '';
+                        const hasSubstantiveText = rawText.length > 0;
+                        const isUserInitiated = isUserInitiatedAction();
+                        const isThoughtChunk = !!(v.thought || v.Ul || v.ln);
+
+                        // 实时收集 Markdown 表格行，消除昂贵的网络层流式克隆与深度反射
+                        if (rawText.includes('|')) {
+                            collectRawLinesFromString(rawText);
+                        }
+
+                        if (hasSubstantiveText || isThoughtChunk) {
                             // 正常流式生长：保持最新最长文本快照
                             const oldText = prevSnapshot ? prevSnapshot.text : '';
                             const longest = rawText.length >= oldText.length ? rawText : oldText;
                             chunkSnapshotCache.set(k, {
                                 id: k,
                                 role: 'model',
-                                thought: !!v.thought,
+                                thought: isThoughtChunk,
                                 text: longest,
-                                Di: v.Di ? [...v.Di] : void 0,
+                                lastRef: v,
+                                Di: v.Di ? [...v.Di] : (v.Ej ? [...v.Ej] : void 0),
+                                Ej: v.Ej ? [...v.Ej] : void 0,
                                 timestamp: v.timestamp || Date.now(),
                                 lastSeen: Date.now()
                             });
                         }
 
-                        // 核心防线 A: 拦截 lJb 撤回空块（AI Studio 因 finishReason 黑名单清空当前轮并插入 text: "" 且带 Dl 的空块）
-                        const hasDeleted = (this._msDeletedChunks && this._msDeletedChunks.length > 0) || recentlyDeletedModelChunks.size > 0;
-                        const finishCode = v.Dl ? v.Dl.finishReason : undefined;
+                        // 核心防线 A: 拦截 AOb/lJb 撤回空块（AI Studio 因 finishReason 黑名单清空当前轮并插入 text: "" 的空块）
+                        const finishMetaObj = getChunkFinishMeta(v);
+                        const finishCode = finishMetaObj && finishMetaObj.meta ? finishMetaObj.meta.finishReason : undefined;
                         const isRetractReason = finishCode !== undefined && RETRACT_FINISH_REASONS.has(finishCode);
+                        const hasDeleted = (this._msDeletedChunks && this._msDeletedChunks.length > 0) || recentlyDeletedModelChunks.size > 0;
 
                         if (!isUserInitiated && !hasSubstantiveText && isRetractReason && hasDeleted) {
-                            let rescuedMainText = '';
-                            let rescuedThoughtText = '';
                             const now = Date.now();
-
-                            // 优先从当前同一个 Map 实例关联的被删列表中提取
                             const candidateList = (this._msDeletedChunks && this._msDeletedChunks.length > 0)
                                 ? this._msDeletedChunks
                                 : Array.from(recentlyDeletedModelChunks.values());
 
+                            const thoughtChunks = [];
+                            const mainChunks = [];
+                            const seenChunkIds = new Set();
+
                             for (let i = 0; i < candidateList.length; i++) {
                                 const rec = candidateList[i];
-                                if (now - rec.deletedAt < 5000) {
+                                if (now - rec.deletedAt < 8000) {
                                     const ch = rec.chunk;
-                                    if (ch.thought && ch.text) {
-                                        if (ch.text.length > rescuedThoughtText.length) {
-                                            rescuedThoughtText = ch.text;
-                                        }
-                                    } else if (ch.text && ch.text.trim().length > 0) {
-                                        if (ch.text.length > rescuedMainText.length) {
-                                            rescuedMainText = ch.text;
-                                        }
+                                    const cid = rec.id || ch.id;
+                                    if (cid && seenChunkIds.has(cid)) continue;
+                                    if (cid) seenChunkIds.add(cid);
+
+                                    const chText = typeof ch.text === 'string' ? ch.text : '';
+                                    if (ch.thought) {
+                                        if (chText.trim().length > 0) thoughtChunks.push(chText);
+                                    } else if (chText.trim().length > 0) {
+                                        mainChunks.push(chText);
                                     }
                                 }
                             }
 
-                            if (rescuedMainText.trim().length > 0 || rescuedThoughtText.trim().length > 0) {
-                                const finishMsg = (v.Dl && v.Dl.finishMessage) ? ` (${v.Dl.finishMessage})` : '';
+                            const combinedThought = thoughtChunks.join('\n\n');
+                            const combinedMain = mainChunks.join('\n\n');
+
+                            if (combinedMain.trim().length > 0 || combinedThought.trim().length > 0) {
+                                const finishMsg = (finishMetaObj && finishMetaObj.meta && finishMetaObj.meta.finishMessage) ? ` (${finishMetaObj.meta.finishMessage})` : '';
 
                                 let injected = '';
-                                if (rescuedThoughtText.trim().length > 0) {
-                                    injected += `> 💭 **[已救回的思考过程]**\n>\n> ${rescuedThoughtText.replace(/\r?\n/g, '\n> ')}\n\n`;
+                                if (combinedThought.trim().length > 0) {
+                                    injected += `> 💭 **[已救回的思考过程]**\n>\n> ${combinedThought.replace(/\r?\n/g, '\n> ')}\n\n`;
                                 }
-                                if (rescuedMainText.trim().length > 0) {
-                                    injected += rescuedMainText;
-                                } else if (rescuedThoughtText.trim().length > 0) {
+                                if (combinedMain.trim().length > 0) {
+                                    injected += combinedMain;
+                                } else if (combinedThought.trim().length > 0) {
                                     injected += `> 💭 *[模型在思考阶段被中断撤回，已完整保留思考内容]*`;
                                 }
 
@@ -191,15 +276,18 @@
 
                                 v.text = injected;
                                 v._msAntiRetractionRescued = true;
-                                v._originalDl = Object.assign({}, v.Dl);
-                                // 修正 finishReason 为正常完成 1 (STOP)，防止 Angular 模板判定为黑名单错误而隐藏或折叠正文
-                                v.Dl = Object.assign({}, v.Dl, { finishReason: 1 });
+                                if (finishMetaObj) {
+                                    v._originalDl = Object.assign({}, finishMetaObj.meta);
+                                    setChunkFinishMeta(v, { finishReason: 1 });
+                                }
                                 v.incomplete = false;
-                                v.Ub = 1;
-                                v.Ul = false;
+                                if ('Ub' in v) v.Ub = 1;
+                                if ('lc' in v) v.lc = 1;
+                                if ('Ul' in v) v.Ul = false;
+                                if ('ln' in v) v.ln = false;
 
                                 try {
-                                    console.info(`[AI Studio Fix] 🛡️ 成功拦截并复活异常撤回回复 (finishReason: ${finishCode})`);
+                                    console.info(`[AI Studio Fix] 🛡️ (第2层) 成功拦截并复活异常撤回回复 (finishReason: ${finishCode})`);
                                 } catch (_) {}
 
                                 this._msDeletedChunks = [];
@@ -207,11 +295,14 @@
                             }
                         }
 
-                        // 核心防线 B: 拦截 WIb / KHa 意外原地覆写清空（无用户交互时已有长文本突然被置空）
+                        // 核心防线 B: 拦截 WIb / kOb / hJa 意外原地覆写清空（无用户交互时已有长文本突然被置空）
                         if (!isUserInitiated && !hasSubstantiveText && prevSnapshot && prevSnapshot.text && prevSnapshot.text.length > 20) {
                             v.text = prevSnapshot.text;
                             if (prevSnapshot.Di && (!v.Di || v.Di.length === 0)) {
                                 v.Di = [...prevSnapshot.Di];
+                            }
+                            if (prevSnapshot.Ej && (!v.Ej || v.Ej.length === 0)) {
+                                v.Ej = [...prevSnapshot.Ej];
                             }
                             v._msAntiRetractionPreserved = true;
                         }
@@ -302,54 +393,15 @@
         ? win.TextDecoder.prototype.decode
         : (typeof TextDecoder !== 'undefined' ? TextDecoder.prototype.decode : null);
 
-    // 钩子 A: 拦截 fetch (AI Studio 的核心流式数据通信管道 streamGenerateContent)
+    // 钩子 A: 拦截 fetch (已由 Map.prototype.set 直接接管流式实体文本，无需耗费 CPU 进行全流 clone 与重复解码)
     if (typeof win.fetch === 'function') {
         const origFetch = win.fetch;
         win.fetch = function (...args) {
-            const fetchPromise = origFetch.apply(this, args);
-            fetchPromise.then((response) => {
-                try {
-                    if (response && response.clone) {
-                        const ct = (response.headers && response.headers.get('content-type')) || '';
-                        // 过滤二进制或多媒体响应，避免无谓克隆与解码
-                        if (/^(image|video|audio|font)\/|octet-stream|wasm/i.test(ct)) {
-                            return;
-                        }
-                        const clone = response.clone();
-                        if (clone.body && typeof clone.body.getReader === 'function') {
-                            const reader = clone.body.getReader();
-                            const decoder = new (win.TextDecoder || TextDecoder)();
-                            let accumulatedText = '';
-                            const streamState = { pos: 0 };
-
-                            const pump = () => {
-                                reader.read().then(({ done, value }) => {
-                                    if (value) {
-                                        const chunk = rawDecode
-                                            ? rawDecode.call(decoder, value, { stream: !done })
-                                            : decoder.decode(value, { stream: !done });
-                                        accumulatedText += chunk;
-                                        collectRawLinesFromString(chunk);
-                                        collectFromJsonText(accumulatedText, streamState);
-                                    }
-                                    if (!done) {
-                                        pump();
-                                    } else {
-                                        collectFromJsonText(accumulatedText, streamState);
-                                        collectRawLinesFromString(accumulatedText);
-                                    }
-                                }).catch(() => {});
-                            };
-                            pump();
-                        }
-                    }
-                } catch (e) {}
-            }).catch(() => {});
-            return fetchPromise;
+            return origFetch.apply(this, args);
         };
     }
 
-    // 钩子 B: 拦截 JSON.parse (捕获一次性下发的 JSPB 数据)
+    // 钩子 B: 拦截 JSON.parse (轻量捕获一次性下发的 JSPB 数据，杜绝 25 层全对象树递归)
     if (win.JSON && win.JSON.parse) {
         const origJSONParse = win.JSON.parse;
         win.JSON.parse = function () {
@@ -357,17 +409,7 @@
             try {
                 const rawArg = arguments[0];
                 if (typeof rawArg === 'string' && (rawArg.includes('begin{') || rawArg.includes('|'))) {
-                    const scanObj = (obj, depth) => {
-                        if (depth > 25 || !obj) return;
-                        if (typeof obj === 'string') {
-                            collectRawLinesFromString(obj);
-                        } else if (Array.isArray(obj)) {
-                            for (let i = 0; i < obj.length; i++) scanObj(obj[i], depth + 1);
-                        } else if (typeof obj === 'object') {
-                            for (const k in obj) scanObj(obj[k], depth + 1);
-                        }
-                    };
-                    scanObj(res, 0);
+                    collectFromJsonText(rawArg, null);
                 }
             } catch (e) {}
             return res;
@@ -580,7 +622,7 @@
         if (!rowTitle) return null;
         const want = normTableTitle(rowTitle);
 
-        // 1) 从网络/JSON 截获池里倒序匹配（优先最新的完整行）
+        // 1) 从 Markdown 表格缓冲池中倒序匹配（优先最新的完整行）
         const lines = Array.from(rawMarkdownLines);
         for (let i = lines.length - 1; i >= 0; i--) {
             const line = lines[i];
@@ -591,84 +633,22 @@
             }
         }
 
-        // 2) 递归搜索 Angular LView
-        const visited = new WeakSet();
-        let foundLine = null;
-
-        function searchObj(obj, depth, isTopLView) {
-            if (depth > 12 || !obj || foundLine) return;
-
-            if (typeof obj === 'string') {
-                if (obj.includes(rowTitle) && obj.includes('|')) {
-                    const lines = obj.split(/\r?\n/);
-                    for (let i = lines.length - 1; i >= 0; i--) {
-                        const trimmed = lines[i].trim();
-                        if (trimmed.includes('|') && isCompleteTableLine(trimmed)) {
-                            const cols = splitMarkdownTableRow(trimmed);
-                            if (cols.length === expectedCols && normTableTitle(cols[0]) === want) {
-                                foundLine = trimmed;
-                                return;
-                            }
-                        }
-                    }
-                }
-                return;
+        // 2) 兜底：从内存 chunk 快照缓存中扫描未及时分割的原始文本行（纯内存操作，消除 12 层 Angular LView 反射）
+        for (const snap of chunkSnapshotCache.values()) {
+            if (snap && snap.text && snap.text.includes(rowTitle) && snap.text.includes('|')) {
+                collectRawLinesFromString(snap.text);
             }
-
-            // 穿透 Angular Signals
-            if (typeof obj === 'function') {
-                if (visited.has(obj)) return;
-                visited.add(obj);
-                const syms = Object.getOwnPropertySymbols(obj);
-                for (let i = 0; i < syms.length; i++) {
-                    try { searchObj(obj[syms[i]], depth + 1, false); } catch (e) {}
-                }
-                return;
-            }
-
-            if (typeof obj !== 'object' || obj instanceof Node || obj instanceof Window || obj instanceof Document) return;
-            if (visited.has(obj)) return;
-            visited.add(obj);
-
-            if (Array.isArray(obj)) {
-                const limit = Math.min(obj.length, 100);
-                for (let i = 0; i < limit; i++) {
-                    if (isTopLView && (i === 1 || i === 3 || i === 4 || i === 11)) continue;
-                    try { searchObj(obj[i], depth + 1, false); } catch (e) {}
-                }
-                return;
-            }
-
-            const keys = [
-                ...Object.getOwnPropertyNames(obj),
-                ...Object.getOwnPropertySymbols(obj)
-            ];
-            for (let i = 0; i < keys.length; i++) {
-                const k = keys[i];
-                const ks = String(k);
-                if (ks === 'tView' || ks === 'parent' || ks === 'next' || ks === 'injector') continue;
-                try { searchObj(obj[k], depth + 1, false); } catch (e) {}
+        }
+        for (let i = lines.length - 1; i >= 0; i--) {
+            const line = lines[i];
+            if (!line.includes('|')) continue;
+            const cols = splitMarkdownTableRow(line);
+            if (cols.length === expectedCols && normTableTitle(cols[0]) === want && isCompleteTableLine(line)) {
+                return line;
             }
         }
 
-        // 沿 DOM 树向上查找，穿透火狐 Xray Vision
-        let cur = tr;
-        while (cur && cur !== document.body && !foundLine) {
-            const unwrapped = cur.wrappedJSObject || cur;
-            const ctx = unwrapped.__ngContext__;
-
-            if (Array.isArray(ctx)) {
-                searchObj(ctx, 0, true);
-            } else if (typeof ctx === 'number') {
-                const lview = getLViewById(ctx);
-                if (lview) searchObj(lview, 0, true);
-            } else if (typeof ctx === 'object' && ctx !== null) {
-                searchObj(ctx, 0, false);
-            }
-            cur = cur.parentElement;
-        }
-
-        return foundLine;
+        return null;
     }
 
     // 智能分割 Markdown 表格行（自动忽略 $...$ 与 {...} 内部的竖线 |）
@@ -820,7 +800,29 @@
             // 当仅具有 H1 或无序列表且出现代码关键字时，优先判定为真实代码块；但若包含 Markdown 次级标题(##~######)、加粗或 LaTeX 公式，则确凿为被吞噬文档
             const hasMarkdownStruct = hasSubHeading || hasCjkBold || hasMath || ((hasH1 || hasMarkdownList) && !looksLikeRealCode);
             const isPseudoCode = hasMarkdownStruct && hasCjkSentence;
-            if (!isPseudoCode) return;
+            if (!isPseudoCode) {
+                // 如果先前曾被误判定为伪代码块，但后续流式输出推翻了该判定（如到达了实际编程关键字），立即完整回滚原始外观与 DOM
+                if (cb.hasAttribute('data-ms-code-unpacked')) {
+                    cb.removeAttribute('data-ms-code-unpacked');
+                    cb._msUnpackRawText = null;
+                    const clearProp = (el, p) => {
+                        if (!el || !el.style) return;
+                        if (typeof el.style.removeProperty === 'function') el.style.removeProperty(p);
+                        else el.style[p] = '';
+                    };
+                    ['background', 'border', 'box-shadow', 'margin', 'padding'].forEach(p => clearProp(cb, p));
+                    const header = cb.querySelector('.mat-expansion-panel-header, mat-expansion-panel-header');
+                    clearProp(header, 'display');
+                    const expContent = cb.querySelector('.mat-expansion-panel-content');
+                    clearProp(expContent, 'display');
+                    clearProp(pre, 'display');
+                    if (cb._msUnpackDiv && cb._msUnpackDiv.parentNode === cb) {
+                        cb._msUnpackDiv.remove();
+                    }
+                    cb._msUnpackDiv = null;
+                }
+                return;
+            }
 
             // 3. 原位样式重置（保留 ms-code-block 节点，不破坏 Angular LView 映射）
             cb.setAttribute('data-ms-code-unpacked', '1');
@@ -2156,6 +2158,9 @@
         function getPreviousTextNode(node, boundary) {
             let cur = node;
             while (cur && cur !== boundary) {
+                if (cur !== node && cur.tagName && subBlockTags.has(cur.tagName.toLowerCase())) {
+                    break;
+                }
                 let prev = cur.previousSibling;
                 while (prev) {
                     if (prev.nodeType === 8 || (prev.nodeType === 3 && !prev.nodeValue)) {
@@ -2189,12 +2194,13 @@
                 if (!em.parentNode) return;
                 if (em.hasAttribute('data-fixed-italic') || (em.closest && em.closest('pre, code, [data-fixed-bold], [data-fixed-italic]'))) return;
 
+                const blockBoundary = (em.closest && em.closest('p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote, .callout')) || em.parentNode;
+
                 const prevTextNode = getPrecedingTextNode(em);
                 if (!prevTextNode || prevTextNode.nodeType !== 3) return;
 
-                // 检查前置文本是否以全角/半角标点或汉字结尾，后方可带空格及 1~2 个裸星号（涵盖 )、）、"、”、]、】、》、！等）
-                const punctMatch = prevTextNode.nodeValue.match(/([）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-]|\p{Unified_Ideograph}|\p{Script=Hiragana}|\p{Script=Katakana})\s*\*{1,2}\s*$/u) ||
-                                   prevTextNode.nodeValue.match(/([）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-])\s*$/u);
+                // 检查前置文本是否以全角/半角标点或汉字结尾，后方必须紧随 1~2 个星号（杜绝无星号普通标点误匹配导致跨段吞噬）
+                const punctMatch = prevTextNode.nodeValue.match(/([）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-]|\p{Unified_Ideograph}|\p{Script=Hiragana}|\p{Script=Katakana})\s*\*{1,2}\s*$/u);
                 if (!punctMatch) return;
                 if (/(?:^|[^\\])(?:\\\\)*\\\*\s*$/.test(prevTextNode.nodeValue)) return;
                 const punctIdx = punctMatch.index;
@@ -2204,7 +2210,7 @@
                 if (!emText.trim()) return;
                 if (em.querySelector && em.querySelector('table, pre, code, blockquote, p, ul, ol')) return;
 
-                // 查找加粗开启符 **：优先在 prevTextNode 内部，若无则跨节点向前查找
+                // 查找加粗开启符 **：优先在 prevTextNode 内部，若无则在当前块级容器内向前查找
                 let startNode = null;
                 let lastBoldIdx = -1;
 
@@ -2214,7 +2220,7 @@
                 } else {
                     let curTn = prevTextNode;
                     while (curTn) {
-                        curTn = getPreviousTextNode(curTn, null);
+                        curTn = getPreviousTextNode(curTn, blockBoundary);
                         if (!curTn) break;
                         if (curTn.nodeValue && curTn.nodeValue.includes('**')) {
                             startNode = curTn;
@@ -2227,7 +2233,7 @@
 
                 const beforeBold = startNode.nodeValue.slice(0, lastBoldIdx);
 
-                // 查找前置斜体开启符 *：优先在 startNode 内的 beforeBold 查找，若无则跨节点向前查找前置文本节点
+                // 查找前置斜体开启符 *：优先在 startNode 内的 beforeBold 查找，若无则在当前块级容器内向前查找
                 let openItalicNode = null;
                 let openItalicIdx = -1;
 
@@ -2245,7 +2251,7 @@
                 if (!openItalicNode) {
                     let curTn = startNode;
                     while (curTn) {
-                        curTn = getPreviousTextNode(curTn, null);
+                        curTn = getPreviousTextNode(curTn, blockBoundary);
                         if (!curTn) break;
                         const val = curTn.nodeValue || '';
                         for (let i = val.length - 1; i >= 0; i--) {
@@ -2276,9 +2282,19 @@
                     if (startBoldSlice) strong.appendChild(document.createTextNode(startBoldSlice));
 
                     let s = startNode.nextSibling;
-                    while (s && s !== prevTextNode && !s.contains(prevTextNode)) {
-                        strong.appendChild(s);
+                    const middleNodes = [];
+                    let reached = false;
+                    while (s) {
+                        if (s === prevTextNode || s.contains(prevTextNode)) {
+                            reached = true;
+                            break;
+                        }
+                        middleNodes.push(s);
                         s = s.nextSibling;
+                    }
+                    if (!reached) return;
+                    for (let mIdx = 0; mIdx < middleNodes.length; mIdx++) {
+                        strong.appendChild(middleNodes[mIdx]);
                     }
                     if (endBoldSlice) strong.appendChild(document.createTextNode(endBoldSlice));
                     if (!strong.textContent.trim()) return;
@@ -2399,10 +2415,10 @@
         }
 
         // 方案 B：针对解析器未生成任何 <em> 的纯文本引用块（如末尾缺失闭合 * 的 `> *"恭喜...**31337 (顶级精英) *黑客。”`）
-        // 检索 blockquote, .callout, p 等容器内的未解析裸星号引用
+        // 检索 blockquote, .callout 等引用容器内的未解析裸星号引用（严格排除普通正文段落，防止误伤流式活跃段落）
         const quoteContainers = document.querySelectorAll(
-            'ms-cmark-node blockquote, ms-cmark-node blockquote p, ms-cmark-node .callout, ms-cmark-node .callout p, ms-cmark-node p, ' +
-            '.markdown-content blockquote, .markdown-content blockquote p, .markdown-content .callout, .markdown-content .callout p, .markdown-content p, ' +
+            'ms-cmark-node blockquote, ms-cmark-node blockquote p, ms-cmark-node .callout, ms-cmark-node .callout p, ' +
+            '.markdown-content blockquote, .markdown-content blockquote p, .markdown-content .callout, .markdown-content .callout p, ' +
             'blockquote, blockquote p, .callout, .callout p'
         );
 
@@ -2415,7 +2431,7 @@
                 rawTextNodes.push(tNode);
             }
 
-            const rawQuoteRegex = /(?<![\\*])\*(["“][^*]+?)\*\*([^*]+?[）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-]|\p{Unified_Ideograph}|\p{Script=Hiragana}|\p{Script=Katakana})(?:\s*\*{1,2}\s*|\*{1,2})([^*]+?["”]?)(?:\*|$)/u;
+            const rawQuoteRegex = /(?<![\\*])\*(["“][^*]+?)\*\*([^*]+?[）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-]|\p{Unified_Ideograph}|\p{Script=Hiragana}|\p{Script=Katakana})(?:\s*\*{1,2}\s*|\*{1,2})([^*]+?)(?:\*|(?<=[”"』」’'])\s*$)/u;
 
             rawTextNodes.forEach((node) => {
                 if (!node.parentNode || !node.nodeValue) return;
@@ -2451,14 +2467,14 @@
                 }
 
                 const parent = node.parentNode;
+                if (!parent) return;
+
                 if (beforeText) {
                     parent.insertBefore(document.createTextNode(beforeText), node);
                 }
                 parent.insertBefore(newEm, node);
-                if (afterText) {
-                    parent.insertBefore(document.createTextNode(afterText), node);
-                }
-                node.remove();
+                // 原位更新并保留原始 TextNode，防止 Angular Ivy LView 流式文本节点脱离 DOM 树
+                node.nodeValue = afterText;
             });
         });
     }
@@ -2791,6 +2807,10 @@
             const tc = turn.querySelector('.turn-content');
             if (!ctc || !vsc || !tc) return;
 
+            const curLen = tc.textContent ? tc.textContent.length : 0;
+            if (turn._msLastCheckedLen === curLen && turn.dataset.syncedWideWidth) return;
+            turn._msLastCheckedLen = curLen;
+
             let maxW = tc.scrollWidth || 0;
             const wideEls = tc.querySelectorAll('.katex, .katex-display, ms-katex, table, pre');
             for (let i = 0; i < wideEls.length; i++) {
@@ -2853,18 +2873,33 @@
         syncWideTurnWidths();              // 9. 虚拟滚动宽度对齐
     }
 
+    let isRunningFixes = false;
+    function safeRunAllFixes() {
+        if (isRunningFixes) return;
+        isRunningFixes = true;
+        try {
+            runAllFixes();
+        } finally {
+            if (observer && typeof observer.takeRecords === 'function') {
+                observer.takeRecords();
+            }
+            isRunningFixes = false;
+        }
+    }
+
     let timer = null;
     let firstPendingTs = 0;
     const observer = new (win.MutationObserver || MutationObserver)(() => {
+        if (isRunningFixes) return;
         const now = Date.now();
         if (!firstPendingTs) firstPendingTs = now;
         clearTimeout(timer);
-        // 250ms 防抖，若持续处于高频流式输出中，最多等待 800ms 强制执行一次
-        const delay = (now - firstPendingTs >= 800) ? 0 : 250;
+        // 300ms 防抖，若持续处于高频流式输出中，最多等待 1000ms 强制执行一次
+        const delay = (now - firstPendingTs >= 1000) ? 0 : 300;
         timer = setTimeout(() => {
             timer = null;
             firstPendingTs = 0;
-            runAllFixes();
+            safeRunAllFixes();
         }, delay);
     });
 
@@ -2875,7 +2910,7 @@
             return;
         }
         observer.observe(target, { childList: true, subtree: true, characterData: true });
-        runAllFixes();
+        safeRunAllFixes();
     }
 
     if (document.readyState === 'loading') {
