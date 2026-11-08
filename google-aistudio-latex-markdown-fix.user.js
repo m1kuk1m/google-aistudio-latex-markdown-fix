@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Google AI Studio - LaTeX and Markdown Render Fix
-// @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复
-// @name:ja      Google AI Studio 数式＆Markdownレンダリング修正
+// @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复 (含防撤回/防截断)
+// @name:ja      Google AI Studio 数式＆Markdownレンダリング修正 (リトラクション防止)
 // @namespace    https://github.com/m1kuk1m/google-aistudio-latex-markdown-fix
-// @version      1.1.0
-// @description  Fixes LaTeX table truncation, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, and formatting glitches in Google AI Studio.
-// @description:zh-CN 修复 Google AI Studio 上的 Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式及排版渲染问题
-// @description:ja Google AI Studioにおける数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、各種装飾の不具合を修正します
+// @version      1.4.1
+// @description  Fixes AI Studio output retraction and truncation, LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, and CJK punctuation formatting glitches in Google AI Studio.
+// @description:zh-CN 修复与防护 Google AI Studio 上的回答意外截断与敏感词整段撤回、Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆及 CJK 标点斜体窃取排版问题
+// @description:ja Google AI Studioにおける回答の意図しない切断・取り消し（リトラクション）の防止、数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合を修正します
 // @author       m1kuk1m
 // @match        https://aistudio.google.com/*
 // @require      https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js
@@ -23,26 +23,204 @@
     // 0. 环境桥接：安全获取真实页面 window 对象（兼容 Firefox Xray Vision 与各类油猴运行模式）
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (typeof window !== 'undefined' ? window : globalThis);
 
-    // 1. 原始 Markdown 缓冲池与 Angular LView 映射存储 (弱引用避免内存泄漏)
+    // ==================== 1. 全域防撤回与防截断保护系统 (Anti-Retraction & Truncation Engine) ====================
+    // 背景：AI Studio 在流式生成结束或检测到特定安全/异常码 (finishReason 处于黑名单 jIb 中) 时，
+    // 前端 lJb 会清空本轮所有 model chunk 并替换为 text: "" 的空块，甚至导致已输出的长文本直接被整段撤回蒸发；
+    // 本引擎在 Angular 数据状态层 (entities Map) 精准拦截该撤回过程，并将已生成的实质内容完整保留。
+
+    // AI Studio 官方触发撤回的 finishReason 黑名单 (对应官方源码 jIb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17])
+    const RETRACT_FINISH_REASONS = new Set([3, 4, 5, 7, 8, 9, 11, 14, 15, 17]);
+
+    // 用户主动操作时间戳（用于区分用户主动点击清空/删除/重试 与 系统的被动抽风撤回）
+    let userActiveActionTs = 0;
+    const markUserAction = (e) => {
+        try {
+            const target = e && e.target;
+            if (!target || typeof target.closest !== 'function') return;
+            if (target.closest('button, [role="button"], mat-icon, ms-prompt-run-button, .delete-turn-button, [aria-label*="delete" i], [aria-label*="clear" i], [aria-label*="edit" i], [aria-label*="rerun" i]')) {
+                userActiveActionTs = Date.now();
+            }
+        } catch (_) {}
+    };
+    if (typeof win.addEventListener === 'function') {
+        win.addEventListener('click', markUserAction, true);
+        win.addEventListener('pointerdown', markUserAction, true);
+    }
+    if (typeof window !== 'undefined' && window !== win && typeof window.addEventListener === 'function') {
+        window.addEventListener('click', markUserAction, true);
+        window.addEventListener('pointerdown', markUserAction, true);
+    }
+
+    // 影子快照池：记录所有 model 实体块的最新有效文本及部件快照
+    const chunkSnapshotCache = new Map();
+    // 救援池：暂存刚刚被 delete 的 model 块（键为 chunkId，值为快照与删除时间）
+    const recentlyDeletedModelChunks = new Map();
+
+    function cleanExpiredSnapshots() {
+        const now = Date.now();
+        for (const [id, rec] of recentlyDeletedModelChunks.entries()) {
+            if (now - rec.deletedAt > 6000) {
+                recentlyDeletedModelChunks.delete(id);
+            }
+        }
+        if (chunkSnapshotCache.size > 2500) {
+            const oldestKey = chunkSnapshotCache.keys().next().value;
+            chunkSnapshotCache.delete(oldestKey);
+        }
+    }
+
+    // 原始 Markdown 缓冲池与 Angular LView 映射存储 (弱引用避免内存泄漏)
     const rawMarkdownLines = new Set();
     const lViewMapRefs = [];
     const seenMaps = new WeakSet();
 
-    // 钩子 E: 拦截 Map.prototype.set 弱引用记录 Angular LView 映射表
+    // 钩子 E: 拦截 Map 原型方法（同时守护 Angular LView 映射表与防撤回 entities 数据流）
     const hookMapPrototype = (targetMap) => {
         if (!targetMap || !targetMap.prototype) return;
         const origMapSet = targetMap.prototype.set;
-        targetMap.prototype.set = function (k, v) {
-            if (typeof k === 'number' && Array.isArray(v) && v.length >= 10 && !seenMaps.has(this) && lViewMapRefs.length < 16) {
-                seenMaps.add(this);
-                if (typeof WeakRef !== 'undefined') {
-                    lViewMapRefs.push(new WeakRef(this));
-                } else {
-                    lViewMapRefs.push({ deref: () => this });
+        const origMapDelete = targetMap.prototype.delete;
+
+        // 拦截 delete: 当实体块被 lJb 或 WIb 删除时，迅速打入救援池与当前 Map 实例暂存
+        if (typeof origMapDelete === 'function' && !targetMap.prototype._msHookedDelete) {
+            targetMap.prototype._msHookedDelete = true;
+            targetMap.prototype.delete = function (k) {
+                try {
+                    if (typeof k === 'string' && k !== 'text-input-chunk-id') {
+                        const existing = this.get(k) || chunkSnapshotCache.get(k);
+                        if (existing && existing.role === 'model') {
+                            const text = typeof existing.text === 'string' ? existing.text : '';
+                            if (text.trim().length > 0 || existing.thought) {
+                                const record = {
+                                    chunk: Object.assign({}, existing, { text }),
+                                    deletedAt: Date.now()
+                                };
+                                if (!this._msDeletedChunks) this._msDeletedChunks = [];
+                                this._msDeletedChunks.push(record);
+                                recentlyDeletedModelChunks.set(k, record);
+                                cleanExpiredSnapshots();
+                            }
+                        }
+                    }
+                } catch (_) {}
+                return origMapDelete.apply(this, arguments);
+            };
+        }
+
+        // 拦截 set: 维护快照、捕获 lJb 空块替换、捕获 WIb 覆写清空
+        if (typeof origMapSet === 'function' && !targetMap.prototype._msHookedSet) {
+            targetMap.prototype._msHookedSet = true;
+            targetMap.prototype.set = function (k, v) {
+                // 1. 原有的 Angular LView 映射表记录
+                if (typeof k === 'number' && Array.isArray(v) && v.length >= 10 && !seenMaps.has(this) && lViewMapRefs.length < 16) {
+                    seenMaps.add(this);
+                    if (typeof WeakRef !== 'undefined') {
+                        lViewMapRefs.push(new WeakRef(this));
+                    } else {
+                        lViewMapRefs.push({ deref: () => this });
+                    }
                 }
-            }
-            return origMapSet.apply(this, arguments);
-        };
+
+                // 2. 防撤回核心数据层守卫
+                try {
+                    if (v && typeof v === 'object' && v.role === 'model' && typeof k === 'string') {
+                        const rawText = typeof v.text === 'string' ? v.text : '';
+                        const hasSubstantiveText = rawText.trim().length > 0;
+                        const prevSnapshot = chunkSnapshotCache.get(k);
+                        const isUserInitiated = (Date.now() - userActiveActionTs) < 1500;
+
+                        if (hasSubstantiveText) {
+                            // 正常流式生长：保持最新最长文本快照
+                            const oldText = prevSnapshot ? prevSnapshot.text : '';
+                            const longest = rawText.length >= oldText.length ? rawText : oldText;
+                            chunkSnapshotCache.set(k, {
+                                id: k,
+                                role: 'model',
+                                thought: !!v.thought,
+                                text: longest,
+                                Di: v.Di ? [...v.Di] : void 0,
+                                timestamp: v.timestamp || Date.now(),
+                                lastSeen: Date.now()
+                            });
+                        }
+
+                        // 核心防线 A: 拦截 lJb 撤回空块（AI Studio 因 finishReason 黑名单清空当前轮并插入 text: "" 且带 Dl 的空块）
+                        const hasDeleted = (this._msDeletedChunks && this._msDeletedChunks.length > 0) || recentlyDeletedModelChunks.size > 0;
+                        const finishCode = v.Dl ? v.Dl.finishReason : undefined;
+                        const isRetractReason = finishCode !== undefined && RETRACT_FINISH_REASONS.has(finishCode);
+
+                        if (!isUserInitiated && !hasSubstantiveText && isRetractReason && hasDeleted) {
+                            let rescuedMainText = '';
+                            let rescuedThoughtText = '';
+                            const now = Date.now();
+
+                            // 优先从当前同一个 Map 实例关联的被删列表中提取
+                            const candidateList = (this._msDeletedChunks && this._msDeletedChunks.length > 0)
+                                ? this._msDeletedChunks
+                                : Array.from(recentlyDeletedModelChunks.values());
+
+                            for (let i = 0; i < candidateList.length; i++) {
+                                const rec = candidateList[i];
+                                if (now - rec.deletedAt < 5000) {
+                                    const ch = rec.chunk;
+                                    if (ch.thought && ch.text) {
+                                        if (ch.text.length > rescuedThoughtText.length) {
+                                            rescuedThoughtText = ch.text;
+                                        }
+                                    } else if (ch.text && ch.text.trim().length > 0) {
+                                        if (ch.text.length > rescuedMainText.length) {
+                                            rescuedMainText = ch.text;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (rescuedMainText.trim().length > 0 || rescuedThoughtText.trim().length > 0) {
+                                const finishMsg = (v.Dl && v.Dl.finishMessage) ? ` (${v.Dl.finishMessage})` : '';
+
+                                let injected = '';
+                                if (rescuedThoughtText.trim().length > 0) {
+                                    injected += `> 💭 **[已救回的思考过程]**\n>\n> ${rescuedThoughtText.replace(/\r?\n/g, '\n> ')}\n\n`;
+                                }
+                                if (rescuedMainText.trim().length > 0) {
+                                    injected += rescuedMainText;
+                                } else if (rescuedThoughtText.trim().length > 0) {
+                                    injected += `> 💭 *[模型在思考阶段被中断撤回，已完整保留思考内容]*`;
+                                }
+
+                                injected += `\n\n> 🛡️ **[防撤回保护生效]** 检测到 AI Studio 触发异常撤回（原因代码: \`${finishCode}\`${finishMsg}），已自动拦截并完整保留生成内容。`;
+
+                                v.text = injected;
+                                v._msAntiRetractionRescued = true;
+                                v._originalDl = Object.assign({}, v.Dl);
+                                // 修正 finishReason 为正常完成 1 (STOP)，防止 Angular 模板判定为黑名单错误而隐藏或折叠正文
+                                v.Dl = Object.assign({}, v.Dl, { finishReason: 1 });
+                                v.incomplete = false;
+                                v.Ub = 1;
+                                v.Ul = false;
+
+                                try {
+                                    console.info(`[AI Studio Fix] 🛡️ 成功拦截并复活异常撤回回复 (finishReason: ${finishCode})`);
+                                } catch (_) {}
+
+                                this._msDeletedChunks = [];
+                                recentlyDeletedModelChunks.clear();
+                            }
+                        }
+
+                        // 核心防线 B: 拦截 WIb / KHa 意外原地覆写清空（无用户交互时已有长文本突然被置空）
+                        if (!isUserInitiated && !hasSubstantiveText && prevSnapshot && prevSnapshot.text && prevSnapshot.text.length > 20) {
+                            v.text = prevSnapshot.text;
+                            if (prevSnapshot.Di && (!v.Di || v.Di.length === 0)) {
+                                v.Di = [...prevSnapshot.Di];
+                            }
+                            v._msAntiRetractionPreserved = true;
+                        }
+                    }
+                } catch (_) {}
+
+                return origMapSet.apply(this, arguments);
+            };
+        }
     };
     hookMapPrototype(win.Map);
     if (typeof window !== 'undefined' && window !== win && window.Map) {
@@ -583,6 +761,274 @@
 
     // ==================== 5. 核心修复逻辑 ====================
 
+    // ==================== 5.04 解构因 CommonMark 0 缩进错位导致的伪代码块 (v1.2.0 新增) ====================
+    // 根因：在列表项内嵌套代码块时，若闭合围栏（```）使用 0 缩进（无前导空格），CommonMark 规范将触发列表强制截断，
+    // 原嵌套代码块提前隐式闭合，而该 0 缩进的 ``` 在顶层作用域被解释为一个全新的开启围栏。
+    // 因后续无配对闭合围栏且未声明语言（默认为 Code），导致后续所有普通正文、标题（### 总结）、加粗及数学公式全部被吞入 <ms-code-block>。
+    // 方案：
+    // 1. 保留 <ms-code-block> 原始 DOM 节点（维护 Angular Ivy LView 索引映射），重置其外观并隐藏内部头栏与 <pre>；
+    // 2. 交叉校验代码块特征（排除 python/json 等声明语言及含实际代码关键字的代码块，匹配含 CJK 句子且具备标题、加粗或公式的伪代码块）；
+    // 3. 将吞噬的纯文本按行结构化还原为 <div class="markdown-content ms-unpacked-code"> 内的 <h3>、<ul><li>、<ol><li> 与 <p>；
+    // 4. 解构容器挂载 .markdown-content，后续流水线中的 fixBrokenParagraphs (KaTeX) 与 fixBrokenBoldMarkdown 会自动接管渲染。
+    function fixBrokenCodeBlocks() {
+        const codeBlocks = document.querySelectorAll('ms-code-block');
+        if (!codeBlocks || codeBlocks.length === 0) return;
+
+        codeBlocks.forEach((cb) => {
+            const pre = cb.querySelector('pre');
+            if (!pre) return;
+
+            // 1. 语言标签检测：排除明确指定 python、json、cpp、bash 等正规语言的代码块
+            const titleEl = cb.querySelector('.mat-expansion-panel-header mat-panel-title, .mat-panel-title, mat-panel-title');
+            let lang = '';
+            if (titleEl) {
+                const textParts = [];
+                function scanLangText(node) {
+                    for (let child = node.firstChild; child; child = child.nextSibling) {
+                        if (child.nodeType === 3) {
+                            textParts.push(child.nodeValue || '');
+                        } else if (child.nodeType === 1) {
+                            const tag = child.tagName.toLowerCase();
+                            if (tag === 'mat-icon' || tag === 'svg' || tag === 'button' || (child.classList && child.classList.contains('material-icons'))) {
+                                continue;
+                            }
+                            scanLangText(child);
+                        }
+                    }
+                }
+                scanLangText(titleEl);
+                lang = textParts.join(' ').replace(/\s+/g, ' ').trim().toLowerCase();
+            }
+            if (lang && !['code', 'text', 'plaintext'].includes(lang)) return;
+
+            const rawText = pre.textContent || '';
+            if (cb.hasAttribute('data-ms-code-unpacked')) {
+                if (cb._msUnpackRawText === rawText && cb._msUnpackDiv && cb._msUnpackDiv.isConnected) return;
+            }
+
+            // 2. 精准伪代码块特征判定（多重交叉校验）
+            const hasSubHeading = /(?:^|\n)#{2,6}\s+[^\n]*[\u4e00-\u9fa5]/.test(rawText);
+            const hasH1 = /(?:^|\n)#\s+[^\n]*[\u4e00-\u9fa5]/.test(rawText);
+            const hasCjkBold = /\*\*[^\n*]*[\u4e00-\u9fa5][^\n*]*\*\*/.test(rawText);
+            const hasMath = /(?<!\\)\$[a-zA-Z0-9_{}\\]+\$/.test(rawText) || /\$\$[\s\S]+?\$\$/.test(rawText) || /(?<!\\)\$[^$\n]{1,50}(?<!\\)\$/.test(rawText);
+            const hasMarkdownList = /(?:^|\n)\s*[*+-]\s+[^\n]*[\u4e00-\u9fa5]/.test(rawText);
+            const hasCjkSentence = /[\u4e00-\u9fa5]{2,}[，。！？：；、]/.test(rawText) || /[\u4e00-\u9fa5][\s\S]{0,30}[。！？]/.test(rawText);
+
+            // 排除包含常见编程代码关键字的真实无语言代码块（单行 # 注释常被误认为 H1 标题）
+            const looksLikeRealCode = /(?:^|\n)\s*(?:def|class|import|from\s+\w+\s+import|function|const|let|var|return|public|private)\b/.test(rawText);
+
+            // 当仅具有 H1 或无序列表且出现代码关键字时，优先判定为真实代码块；但若包含 Markdown 次级标题(##~######)、加粗或 LaTeX 公式，则确凿为被吞噬文档
+            const hasMarkdownStruct = hasSubHeading || hasCjkBold || hasMath || ((hasH1 || hasMarkdownList) && !looksLikeRealCode);
+            const isPseudoCode = hasMarkdownStruct && hasCjkSentence;
+            if (!isPseudoCode) return;
+
+            // 3. 原位样式重置（保留 ms-code-block 节点，不破坏 Angular LView 映射）
+            cb.setAttribute('data-ms-code-unpacked', '1');
+            cb.style.setProperty('background', 'transparent', 'important');
+            cb.style.setProperty('border', 'none', 'important');
+            cb.style.setProperty('box-shadow', 'none', 'important');
+            cb.style.setProperty('margin', '0', 'important');
+            cb.style.setProperty('padding', '0', 'important');
+
+            const header = cb.querySelector('.mat-expansion-panel-header, mat-expansion-panel-header');
+            if (header) header.style.setProperty('display', 'none', 'important');
+            const expContent = cb.querySelector('.mat-expansion-panel-content');
+            if (expContent) expContent.style.setProperty('display', 'none', 'important');
+            pre.style.setProperty('display', 'none', 'important');
+
+            if (cb._msUnpackDiv && cb._msUnpackDiv.parentNode === cb) {
+                cb._msUnpackDiv.remove();
+            }
+
+            // 4. 创建标准 markdown-content 容器
+            const unpackDiv = document.createElement('div');
+            unpackDiv.className = 'markdown-content ms-unpacked-code';
+            unpackDiv.setAttribute('data-ms-code-unpack', '1');
+
+            // 5. 基础块元素还原（空行分段、标题、列表、引用、内部代码围栏）
+            const lines = rawText.split(/\r?\n/);
+            let currentBlock = null;
+            let inCodeFence = false;
+            let codeFenceLang = '';
+            let codeFenceLines = [];
+
+            function flushBlock() {
+                currentBlock = null;
+            }
+
+            lines.forEach((line) => {
+                const trimmed = line.trim();
+
+                // 处理内部代码围栏 ```
+                if (trimmed.startsWith('```')) {
+                    if (!inCodeFence) {
+                        flushBlock();
+                        inCodeFence = true;
+                        codeFenceLang = trimmed.slice(3).trim();
+                        codeFenceLines = [];
+                        return;
+                    } else {
+                        inCodeFence = false;
+                        const preEl = document.createElement('pre');
+                        const codeEl = document.createElement('code');
+                        if (codeFenceLang) codeEl.className = 'language-' + codeFenceLang;
+                        codeEl.textContent = codeFenceLines.join('\n');
+                        preEl.appendChild(codeEl);
+                        unpackDiv.appendChild(preEl);
+                        return;
+                    }
+                }
+
+                if (inCodeFence) {
+                    codeFenceLines.push(line);
+                    return;
+                }
+
+                if (!trimmed) {
+                    flushBlock();
+                    return;
+                }
+
+                // 标题: #{1,6}
+                const mHeading = trimmed.match(/^(#{1,6})\s+(.*)$/);
+                if (mHeading) {
+                    flushBlock();
+                    const level = mHeading[1].length;
+                    const hEl = document.createElement('h' + level);
+                    hEl.textContent = mHeading[2].trim();
+                    unpackDiv.appendChild(hEl);
+                    return;
+                }
+
+                // 引用: >
+                const mBq = trimmed.match(/^>\s*(.*)$/);
+                if (mBq) {
+                    if (!currentBlock || currentBlock.type !== 'blockquote') {
+                        flushBlock();
+                        const bq = document.createElement('blockquote');
+                        unpackDiv.appendChild(bq);
+                        currentBlock = { type: 'blockquote', el: bq };
+                    }
+                    const p = document.createElement('p');
+                    p.textContent = mBq[1].trim();
+                    currentBlock.el.appendChild(p);
+                    return;
+                }
+
+                // 无序列表: * / - / +
+                const mUl = trimmed.match(/^[*+-]\s+(.*)$/);
+                if (mUl) {
+                    if (!currentBlock || currentBlock.type !== 'ul') {
+                        flushBlock();
+                        const ul = document.createElement('ul');
+                        unpackDiv.appendChild(ul);
+                        currentBlock = { type: 'ul', el: ul };
+                    }
+                    const li = document.createElement('li');
+                    li.textContent = mUl[1].trim();
+                    currentBlock.el.appendChild(li);
+                    return;
+                }
+
+                // 有序列表: 1. / 2.
+                const mOl = trimmed.match(/^\d+\.\s+(.*)$/);
+                if (mOl) {
+                    if (!currentBlock || currentBlock.type !== 'ol') {
+                        flushBlock();
+                        const ol = document.createElement('ol');
+                        unpackDiv.appendChild(ol);
+                        currentBlock = { type: 'ol', el: ol };
+                    }
+                    const li = document.createElement('li');
+                    li.textContent = mOl[1].trim();
+                    currentBlock.el.appendChild(li);
+                    return;
+                }
+
+                // 列表项缩进续行
+                if (currentBlock && (currentBlock.type === 'ul' || currentBlock.type === 'ol') && /^\s{2,}/.test(line)) {
+                    const lastLi = currentBlock.el.lastElementChild;
+                    if (lastLi) {
+                        lastLi.textContent += '\n' + trimmed;
+                        return;
+                    }
+                }
+
+                // 普通段落
+                if (!currentBlock || currentBlock.type !== 'p') {
+                    flushBlock();
+                    const p = document.createElement('p');
+                    p.textContent = trimmed;
+                    unpackDiv.appendChild(p);
+                    currentBlock = { type: 'p', el: p };
+                } else {
+                    currentBlock.el.textContent += '\n' + trimmed;
+                }
+            });
+            flushBlock();
+            if (inCodeFence && codeFenceLines.length > 0) {
+                const preEl = document.createElement('pre');
+                const codeEl = document.createElement('code');
+                if (codeFenceLang) codeEl.className = 'language-' + codeFenceLang;
+                codeEl.textContent = codeFenceLines.join('\n');
+                preEl.appendChild(codeEl);
+                unpackDiv.appendChild(preEl);
+            }
+
+            // 6. 对解构出的块级元素，若包含 $...$ 或 $$...$$ 公式，使用 KaTeX 进行原位就绪渲染
+            const k = getKaTeX();
+            if (k) {
+                const mathTargets = unpackDiv.querySelectorAll('p, li, h1, h2, h3, h4, h5, h6, blockquote');
+                mathTargets.forEach((targetEl) => {
+                    const rawVal = targetEl.textContent || '';
+                    if (!rawVal.includes('$')) return;
+
+                    const mathRe = /\$\$([\s\S]+?)\$\$|(?<!\\|\$)\$(?!\s)([\s\S]+?)(?<!\s|\\)\$(?!\$)/g;
+                    let lastIdx = 0;
+                    let match;
+                    let hasMath = false;
+                    const frag = document.createDocumentFragment();
+
+                    while ((match = mathRe.exec(rawVal)) !== null) {
+                        const isDisplay = match[1] !== undefined;
+                        const inner = isDisplay ? match[1] : match[2];
+                        const trimmedInner = inner.trim();
+
+                        // 排除货币误匹配（如 $1.00）
+                        if (!isDisplay) {
+                            const afterMatch = rawVal.slice(match.index + match[0].length);
+                            if (/^[0-9]/.test(afterMatch) || /^[0-9]/.test(trimmedInner)) {
+                                continue;
+                            }
+                        }
+
+                        hasMath = true;
+                        if (match.index > lastIdx) {
+                            frag.appendChild(document.createTextNode(rawVal.slice(lastIdx, match.index)));
+                        }
+                        const span = document.createElement('span');
+                        span.setAttribute('data-ms-math-seg', '1');
+                        renderTexInto(span, trimmedInner, isDisplay, k);
+                        frag.appendChild(span);
+                        lastIdx = mathRe.lastIndex;
+                    }
+
+                    if (hasMath) {
+                        if (lastIdx < rawVal.length) {
+                            frag.appendChild(document.createTextNode(rawVal.slice(lastIdx)));
+                        }
+                        targetEl.textContent = '';
+                        targetEl.appendChild(frag);
+                    }
+                });
+            }
+
+            cb.appendChild(unpackDiv);
+            cb._msUnpackDiv = unpackDiv;
+            cb._msUnpackRawText = rawText;
+        });
+    }
+
     // ==================== 5.05 修复被误渲染为公式的美元货币符号 (v1.1.0 新增) ====================
     // 根因：AI Studio 官方前端 Markdown 解析器缺失 Pandoc 规范中“右闭合 $ 后方不能紧跟数字”的校验。
     // 当模型输出形如 `（$19.99/月）和 **Google AI Ultra**（$99.99/月起）` 时，第一个 $（$19.99）符合开启规则，
@@ -736,8 +1182,9 @@
         const k = getKaTeX();
         if (!k) return;
         const elements = document.querySelectorAll(
-            'ms-cmark-node p, ms-cmark-node li, ms-cmark-node blockquote, ' +
-            '.markdown-content p, .markdown-content li, .markdown-content blockquote'
+            'ms-cmark-node p, ms-cmark-node li, ms-cmark-node blockquote, ms-cmark-node blockquote p, ms-cmark-node .callout, ms-cmark-node .callout p, ' +
+            '.markdown-content p, .markdown-content li, .markdown-content blockquote, .markdown-content blockquote p, .markdown-content .callout, .markdown-content .callout p, ' +
+            'blockquote, blockquote p, .callout, .callout p'
         );
         const supportedEnvs = new Set([
             'aligned', 'align', 'align*', 'gather', 'gather*',
@@ -1442,66 +1889,73 @@
         });
     }
 
-    // ==================== 5.15 修复波浪号(~)区间被误解析为 <sub> 下标 (v6.5 新增) ====================
-    // 根因：AI Studio 的 Markdown 解析器 (ms-cmark-node) 启用了单波浪号下标扩展 (~text~ -> <sub>text</sub>)，
-    // 在中文排版中（如 `2万~5万日元（约1000~2500人民币）`），两组数值区间之间的汉字和全角符号中间没有 ASCII 空格，
-    // 导致第 1 个区间的 `~` 与第 2 个区间的 `~` 被跨区间误配对成一对下标定界符，两个 `~` 被解析器吞掉，中间内容变成 <sub> 缩小下沉。
-    // 方案：在保持 Angular LView DOM 节点引用原位不动的前提下，识别误判的 <sub> 并将其样式重置为 normal baseline，
-    // 同时在 <sub> 内部首尾补齐丢失的 `~` 节点，用户复制时完整保留波浪号，且与后续的 fixBrokenBoldMarkdown 无缝联动。
-    function fixBrokenSubscriptMarkdown() {
-        const subElements = document.querySelectorAll('ms-cmark-node sub, .markdown-content sub');
-        if (!subElements || subElements.length === 0) return;
+    // ==================== 5.15 修复波浪号(~)区间被误解析为下标(sub)或删除线(del) (v1.2.0 重构) ====================
+    // 根因：AI Studio 的 Markdown 解析器启用单波浪号扩展，两组数值区间（如 `5%~16%` 与 `**3~5 次**`）之间的
+    // 汉字由于无 ASCII 空格，导致跨区间波浪号被误配对为下标(sub)或删除线(del/s/strike)，导致内容被删除线划掉且首尾波浪号丢失。
+    // 在与 ** 加粗交叉嵌套时还会发生标签分裂（Tag Splitting），导致如 3 与 5 粘连并加粗为 35 次。
+    // 方案：
+    // 1. 扩充选择器纳管 sub, del, s, strike，在保持 Angular LView DOM 节点引用原位不动的前提下抹除下标或删除线样式；
+    // 2. 严密数值区间特征防线：对 del/s 标签严格校验两端是否紧贴数值区间边界，杜绝误杀合法中文删除线（如 ~~已作废~~）；
+    // 3. 在标签内部首尾插入补齐的 ~ 节点，并智能检测邻近的 <strong> 边界继承粗体字重，使数字与波浪号视觉融合。
+    function fixBrokenTildeMarkdown() {
+        const tildeElements = document.querySelectorAll(
+            'ms-cmark-node sub, ms-cmark-node del, ms-cmark-node s, ms-cmark-node strike, ' +
+            '.markdown-content sub, .markdown-content del, .markdown-content s, .markdown-content strike'
+        );
+        if (!tildeElements || tildeElements.length === 0) return;
 
-        function isBrokenTildeSubscript(subText, prev, next) {
-            if (!subText) return false;
+        function isBrokenTilde(el, text, prev, next, rawPrev, rawNext) {
+            if (!text) return false;
+            const tag = el.tagName.toLowerCase();
+            const isDel = ['del', 's', 'strike'].includes(tag);
 
-            // 1. 包含 CJK 字符或全角/中文标点（如 5万日元（约1000）
-            if (/[\u3000-\u303f\u3040-\u30ff\u3400-\u9fff\uff00-\uffef『』「」《》【】（）—…·]/u.test(subText)) {
-                return true;
+            const prevEndsNum = /(?:[0-9]\s*(?:[%°℃万亿千百KkMmGg¥$€£次个条点分秒元块角米]|ms|s|h|d|min|px|em|rem)?|[¥$€£])$/u.test(prev);
+            const subStartsNum = /^[¥$€£]?\s*[0-9]/u.test(text);
+            const subEndsNum = /[0-9]\s*(?:[%°℃万亿千百KkMmGg¥$€£次个条点分秒元块角米]|ms|s|h|d|min|px|em|rem)?$/u.test(text);
+            const nextStartsNum = /^[¥$€£]?\s*[0-9]/u.test(next);
+
+            // 【关键防线】：对 del/s 标签，必须严格校验双端是否均处于数字区间边界且无多余空格，严禁误杀合法中文删除线（如 ~~已作废~~、~~500元~~200元）
+            if (isDel) {
+                const hasPrevSpace = /\s$/.test(rawPrev) || /\s\*+$/.test(rawPrev);
+                const hasNextSpace = /^\s/.test(rawNext) || /^\*+\s/.test(rawNext);
+                const leftValid = prevEndsNum && subStartsNum && !hasPrevSpace;
+                const rightValid = subEndsNum && nextStartsNum && !hasNextSpace;
+                return leftValid && rightValid;
             }
 
-            // 2. 处于数字区间边界
-            // 前方以数字或数字单位结尾，且 subText 以数字开头 (如 100~200)
-            const prevEndsNum = /[0-9][%°℃万亿千百KkMmGg]?$/u.test(prev);
-            const subStartsNum = /^[¥$€£]?\s*[0-9]/u.test(subText);
+            // 针对 sub 标签的判定逻辑（保持既有高覆盖率规则）
+            if (/[\u3000-\u303f\u3040-\u30ff\u3400-\u9fff\uff00-\uffef『』「」《》【】（）—…·]/u.test(text)) return true;
             if (prevEndsNum && subStartsNum) return true;
-
-            // subText 以数字结尾，且后方以数字开头 (如 ...1000~2500)
-            const subEndsNum = /[0-9][%°℃万亿千百KkMmGg]?$/u.test(subText);
-            const nextStartsNum = /^[¥$€£]?\s*[0-9]/u.test(next);
             if (subEndsNum && nextStartsNum) return true;
-
-            // 3. 包含非下标标点符号、超长文本、未闭合括号等
-            if (subText.length > 12) return true;
-            if (/[~～%$¥€£@#&*;:"'<>?!\/\\]/.test(subText)) return true;
-            if ((subText.match(/\(/g) || []).length !== (subText.match(/\)/g) || []).length) return true;
-            if (subText.includes('**')) return true;
-
+            if (text.length > 12) return true;
+            if (/[~～%$¥€£@#&*;:"'<>?!\/\\]/.test(text)) return true;
+            if ((text.match(/\(/g) || []).length !== (text.match(/\)/g) || []).length) return true;
+            if (text.includes('**')) return true;
             return false;
         }
 
-        subElements.forEach((sub) => {
-            if (sub.hasAttribute('data-ms-unsub')) return;
-            if (sub.closest('[data-ms-math-seg], [data-ms-math-text], [data-ms-math-hidden]')) return;
+        tildeElements.forEach((el) => {
+            if (el.hasAttribute('data-ms-unsub')) return;
+            if (el.closest('[data-ms-math-seg], [data-ms-math-text], [data-ms-math-hidden]')) return;
 
-            const subText = sub.textContent || '';
-            const blockContainer = sub.closest(
+            const text = el.textContent || '';
+            const blockContainer = el.closest(
                 'p, li, td, th, h1, h2, h3, h4, h5, h6, blockquote, ms-cmark-node'
             );
 
             let prevText = '';
             let nextText = '';
             if (blockContainer) {
-                let reachedSub = false;
+                let reached = false;
                 const walker = document.createTreeWalker(blockContainer, NodeFilter.SHOW_TEXT, null);
                 let node;
                 while ((node = walker.nextNode())) {
                     if (node.parentElement && node.parentElement.closest('pre')) continue;
-                    if (sub.contains(node)) {
-                        reachedSub = true;
+                    if (el.contains(node)) {
+                        reached = true;
                         continue;
                     }
-                    if (!reachedSub) {
+                    if (!reached) {
                         prevText += node.nodeValue || '';
                     } else {
                         nextText += node.nodeValue || '';
@@ -1513,11 +1967,16 @@
             const cleanPrev = prevText.slice(-50).replace(/\*+$/, '').trimEnd();
             const cleanNext = nextText.slice(0, 50).replace(/^\*+/, '').trimStart();
 
-            if (isBrokenTildeSubscript(subText, cleanPrev, cleanNext)) {
-                sub.setAttribute('data-ms-unsub', 'true');
-                sub.style.verticalAlign = 'baseline';
-                sub.style.fontSize = 'inherit';
-                sub.style.lineHeight = 'inherit';
+            if (isBrokenTilde(el, text, cleanPrev, cleanNext, prevText, nextText)) {
+                el.setAttribute('data-ms-unsub', 'true');
+                const tag = el.tagName.toLowerCase();
+                if (tag === 'sub') {
+                    el.style.setProperty('vertical-align', 'baseline', 'important');
+                    el.style.setProperty('font-size', 'inherit', 'important');
+                    el.style.setProperty('line-height', 'inherit', 'important');
+                } else {
+                    el.style.setProperty('text-decoration', 'none', 'important');
+                }
 
                 const openTilde = document.createElement('span');
                 openTilde.textContent = '~';
@@ -1527,11 +1986,483 @@
                 closeTilde.textContent = '~';
                 closeTilde.setAttribute('data-ms-sub-tilde', 'close');
 
-                sub.insertBefore(openTilde, sub.firstChild);
-                sub.appendChild(closeTilde);
+                function isStrongNode(node) {
+                    return !!(node && node.nodeType === 1 && (node.tagName === 'STRONG' || node.tagName === 'B'));
+                }
+
+                // 保持粗体字重一致：若首端紧邻 <strong>，设置 bold（跳过空白文本节点，严格避免误判末尾 strong）
+                let firstBorderNode = el.firstChild;
+                while (firstBorderNode && firstBorderNode.nodeType === 3 && !firstBorderNode.nodeValue.trim()) {
+                    firstBorderNode = firstBorderNode.nextSibling;
+                }
+                let prevBorderNode = el.previousSibling;
+                while (prevBorderNode && prevBorderNode.nodeType === 3 && !prevBorderNode.nodeValue.trim()) {
+                    prevBorderNode = prevBorderNode.previousSibling;
+                }
+                if (isStrongNode(firstBorderNode) || isStrongNode(prevBorderNode)) {
+                    openTilde.style.fontWeight = 'bold';
+                }
+
+                // 保持粗体字重一致：若闭合端紧邻 <strong>，设置 bold（跳过空白文本节点）
+                let lastBorderNode = el.lastChild;
+                while (lastBorderNode && lastBorderNode.nodeType === 3 && !lastBorderNode.nodeValue.trim()) {
+                    lastBorderNode = lastBorderNode.previousSibling;
+                }
+                let nextBorderNode = el.nextSibling;
+                while (nextBorderNode && nextBorderNode.nodeType === 3 && !nextBorderNode.nodeValue.trim()) {
+                    nextBorderNode = nextBorderNode.nextSibling;
+                }
+                if (isStrongNode(lastBorderNode) || isStrongNode(nextBorderNode)) {
+                    closeTilde.style.fontWeight = 'bold';
+                }
+
+                el.insertBefore(openTilde, el.firstChild);
+                el.appendChild(closeTilde);
             }
         });
     }
+
+    // ==================== 5.18 修复生化/蛋白质星号命名误拆 (v1.3.0 新增) ====================
+    // 根因：针对如 `一种名为 **A$\beta$*56** 的特定淀粉样蛋白寡聚体。` 的排版，CommonMark 引擎在遇到混排 LaTeX 结尾 `$` 时
+    // 绕过了 3 的倍数规则，将结构拆成了前置孤立 `*` 文本 + `<em>A<ms-katex>\beta</ms-katex></em>` + `<em>56</em>`。
+    // 方案：高特征守门检测前置裸单星号（严格排除连续星号与反斜杠转义 \*）、紧随两个连续 <em> 元素且第二个 <em> 为纯数字/生化亚型（/^\d+[a-zA-Z]?$/），
+    // 原位重构为标准加粗 <strong>，还原中间的字面量星号 `*`，消除前置暴露的单星号及后方可能的单星号残留。
+    function fixBrokenBiochemicalStarBold() {
+        const emElements = document.querySelectorAll(
+            'ms-cmark-node em, .markdown-content em, em'
+        );
+        if (!emElements || emElements.length === 0) return;
+
+        emElements.forEach((em1) => {
+            if (!em1.parentNode) return;
+            if (em1.hasAttribute('data-fixed-italic') || (em1.closest && em1.closest('pre, code, [data-fixed-bold], [data-ms-biochem-bold]'))) return;
+
+            let prevNode = em1.previousSibling;
+            while (prevNode && ((prevNode.nodeType === 3 && !prevNode.nodeValue) || prevNode.nodeType === 8)) {
+                prevNode = prevNode.previousSibling;
+            }
+            if (prevNode && prevNode.nodeType === 1) {
+                for (let c = prevNode.lastChild; c; c = c.previousSibling) {
+                    if (c.nodeType === 3 && c.nodeValue) { prevNode = c; break; }
+                }
+            }
+            if (!prevNode || prevNode.nodeType !== 3) return;
+            // 校验前置文本必须以孤立单星号结尾（严格排除连续星号与反斜杠转义 \*）
+            if (!/(?<!\*)\*$/.test(prevNode.nodeValue)) return;
+            if (/(?:^|[^\\])(?:\\\\)*\\\*$/.test(prevNode.nodeValue)) return;
+
+            let em2 = em1.nextSibling;
+            while (em2 && ((em2.nodeType === 3 && !em2.nodeValue) || em2.nodeType === 8)) {
+                em2 = em2.nextSibling;
+            }
+            if (!em2 || em2.nodeType !== 1 || em2.tagName.toLowerCase() !== 'em') return;
+
+            // 守门 1: 第二个 <em> 必须为纯数字或数字+单个字母亚型（如 56, 42, 1a, 02）
+            const em2Text = (em2.textContent || '').trim();
+            if (!/^\d+[a-zA-Z]?$/.test(em2Text)) return;
+
+            // 守门 2: 第一个 <em> 必须为非空行内生化名称且不包含换行或代码块
+            const em1Text = (em1.textContent || '').trim();
+            if (!em1Text || em1Text.length > 100 || em1Text.includes('\n')) return;
+            if (em1.querySelector && em1.querySelector('table, pre, code, blockquote')) return;
+
+            // 执行逆向重构
+            prevNode.nodeValue = prevNode.nodeValue.slice(0, -1);
+            const strong = document.createElement('strong');
+            strong.setAttribute('data-fixed-bold', 'true');
+            strong.setAttribute('data-ms-biochem-bold', '1');
+
+            while (em1.firstChild) {
+                strong.appendChild(em1.firstChild);
+            }
+            strong.appendChild(document.createTextNode('*'));
+            while (em2.firstChild) {
+                strong.appendChild(em2.firstChild);
+            }
+
+            // 检查并清除 em2 后方可能残留的孤立单星号（闭合 ** 泄露）
+            let nextNode = em2.nextSibling;
+            while (nextNode && ((nextNode.nodeType === 3 && !nextNode.nodeValue) || nextNode.nodeType === 8)) {
+                nextNode = nextNode.nextSibling;
+            }
+            if (nextNode && nextNode.nodeType === 1) {
+                for (let c = nextNode.firstChild; c; c = c.nextSibling) {
+                    if (c.nodeType === 3 && c.nodeValue) { nextNode = c; break; }
+                }
+            }
+            if (
+                nextNode &&
+                nextNode.nodeType === 3 &&
+                /^\*(?!\*)/.test(nextNode.nodeValue) &&
+                !/(?:^|[^\\])(?:\\\\)*\\\*/.test(nextNode.nodeValue)
+            ) {
+                nextNode.nodeValue = nextNode.nodeValue.replace(/^\*/, '');
+            }
+
+            em1.parentNode.insertBefore(strong, em1);
+            em1.remove();
+            em2.remove();
+        });
+    }
+
+    // ==================== 5.19 修复 CJK 标点加粗与斜体窃取补偿 (v1.3.2 深度重构版) ====================
+    // 根因：针对如 `> *“恭喜你找到了这个严重漏洞，你就是我们认可的**31337 (顶级精英) *黑客。”*`，
+    // 全角/半角右括号（`）`、`)`）、引号、书名号等在后方紧随汉字或空格时使闭合 `**` 沦为仅开启符或无法闭合，
+    // 导致末尾 `*` 窃取其 1 个星号组成 `<em>` 并在正文中暴露裸星号，或者在缺失末尾 `*` 时整段作为裸星号文本暴露在 blockquote 中。
+    // 在真实 Google AI Studio 中，Angular Ivy 会将文本节点包裹在 `<span class="ng-star-inserted">` 中，
+    // 且存在 `<ms-cmark-node>` 嵌套，旧版直接读取 em.previousSibling 并断言其 nodeType === 3 会直接踏空退出。
+    // 方案：
+    //   1. 方案 A（窃取 em 修复）：引入 getPrecedingTextNode 与 getPreviousTextNode 深度穿透 Angular 的 span 与 ms-cmark-node 容器，
+    //      全面放行半角/全角括号、中英文引号及标点与星号之间的任意空格（\s*），精准截取加粗词并原位重构为标准 strong，
+    //      同时跨节点寻回前置引用斜体开启符，消除所有多余裸露星号并清理末尾星号残留；
+    //   2. 方案 B（纯文本 blockquote 兜底）：遍历 blockquote、blockquote p、.callout 等容器，
+    //      对未被 CommonMark 解析为 em 的裸星号引用文本进行行内正则解构与重组，确保无论解析器是否生成 em 均 100% 修复。
+    function fixBrokenCjkPunctuationBold() {
+        const subBlockTags = new Set(['p', 'li', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'ul', 'ol', 'table', 'pre', 'hr']);
+
+        function getLastTextNode(node) {
+            if (!node) return null;
+            if (node.nodeType === 3) return node;
+            if (node.nodeType === 1) {
+                for (let c = node.lastChild; c; c = c.previousSibling) {
+                    const found = getLastTextNode(c);
+                    if (found && found.nodeValue) return found;
+                }
+            }
+            return null;
+        }
+
+        function getPrecedingTextNode(node) {
+            let cur = node.previousSibling;
+            while (cur) {
+                if (cur.nodeType === 8 || (cur.nodeType === 3 && !cur.nodeValue)) {
+                    cur = cur.previousSibling;
+                    continue;
+                }
+                if (cur.nodeType === 3) return cur;
+                if (cur.nodeType === 1) {
+                    const tag = cur.tagName.toLowerCase();
+                    if (subBlockTags.has(tag) || tag === 'pre' || tag === 'code' || tag === 'blockquote') {
+                        return null;
+                    }
+                    const tn = getLastTextNode(cur);
+                    if (tn) return tn;
+                }
+                cur = cur.previousSibling;
+            }
+            return null;
+        }
+
+        function getPreviousTextNode(node, boundary) {
+            let cur = node;
+            while (cur && cur !== boundary) {
+                let prev = cur.previousSibling;
+                while (prev) {
+                    if (prev.nodeType === 8 || (prev.nodeType === 3 && !prev.nodeValue)) {
+                        prev = prev.previousSibling;
+                        continue;
+                    }
+                    if (prev.nodeType === 3) return prev;
+                    if (prev.nodeType === 1) {
+                        const tag = prev.tagName.toLowerCase();
+                        if (subBlockTags.has(tag) || tag === 'pre' || tag === 'code' || tag === 'blockquote') {
+                            return null;
+                        }
+                        const tn = getLastTextNode(prev);
+                        if (tn) return tn;
+                    }
+                    prev = prev.previousSibling;
+                }
+                cur = cur.parentNode;
+            }
+            return null;
+        }
+
+        // 方案 A：针对已生成失窃 <em> 的场景
+        const emElements = document.querySelectorAll(
+            'ms-cmark-node em, ms-cmark-node blockquote em, ms-cmark-node .callout em, ' +
+            '.markdown-content em, blockquote em, .callout em, em'
+        );
+
+        if (emElements && emElements.length > 0) {
+            emElements.forEach((em) => {
+                if (!em.parentNode) return;
+                if (em.hasAttribute('data-fixed-italic') || (em.closest && em.closest('pre, code, [data-fixed-bold], [data-fixed-italic]'))) return;
+
+                const prevTextNode = getPrecedingTextNode(em);
+                if (!prevTextNode || prevTextNode.nodeType !== 3) return;
+
+                // 检查前置文本是否以全角/半角标点或汉字结尾，后方可带空格及 1~2 个裸星号（涵盖 )、）、"、”、]、】、》、！等）
+                const punctMatch = prevTextNode.nodeValue.match(/([）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-]|\p{Unified_Ideograph}|\p{Script=Hiragana}|\p{Script=Katakana})\s*\*{1,2}\s*$/u) ||
+                                   prevTextNode.nodeValue.match(/([）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-])\s*$/u);
+                if (!punctMatch) return;
+                if (/(?:^|[^\\])(?:\\\\)*\\\*\s*$/.test(prevTextNode.nodeValue)) return;
+                const punctIdx = punctMatch.index;
+
+                // 守门：被窃取的 <em> 必须为非空行内文本且不包含块级元素
+                const emText = em.textContent || '';
+                if (!emText.trim()) return;
+                if (em.querySelector && em.querySelector('table, pre, code, blockquote, p, ul, ol')) return;
+
+                // 查找加粗开启符 **：优先在 prevTextNode 内部，若无则跨节点向前查找
+                let startNode = null;
+                let lastBoldIdx = -1;
+
+                if (prevTextNode.nodeValue.lastIndexOf('**', punctIdx) !== -1) {
+                    startNode = prevTextNode;
+                    lastBoldIdx = prevTextNode.nodeValue.lastIndexOf('**', punctIdx);
+                } else {
+                    let curTn = prevTextNode;
+                    while (curTn) {
+                        curTn = getPreviousTextNode(curTn, null);
+                        if (!curTn) break;
+                        if (curTn.nodeValue && curTn.nodeValue.includes('**')) {
+                            startNode = curTn;
+                            lastBoldIdx = curTn.nodeValue.lastIndexOf('**');
+                            break;
+                        }
+                    }
+                }
+                if (!startNode || lastBoldIdx === -1) return;
+
+                const beforeBold = startNode.nodeValue.slice(0, lastBoldIdx);
+
+                // 查找前置斜体开启符 *：优先在 startNode 内的 beforeBold 查找，若无则跨节点向前查找前置文本节点
+                let openItalicNode = null;
+                let openItalicIdx = -1;
+
+                for (let i = beforeBold.length - 1; i >= 0; i--) {
+                    if (beforeBold[i] === '*' && beforeBold[i - 1] !== '*' && beforeBold[i + 1] !== '*') {
+                        const beforeStar = beforeBold.slice(0, i);
+                        if (!/(?:^|[^\\])(?:\\\\)*\\$/.test(beforeStar)) {
+                            openItalicNode = startNode;
+                            openItalicIdx = i;
+                            break;
+                        }
+                    }
+                }
+
+                if (!openItalicNode) {
+                    let curTn = startNode;
+                    while (curTn) {
+                        curTn = getPreviousTextNode(curTn, null);
+                        if (!curTn) break;
+                        const val = curTn.nodeValue || '';
+                        for (let i = val.length - 1; i >= 0; i--) {
+                            if (val[i] === '*' && val[i - 1] !== '*' && val[i + 1] !== '*') {
+                                const beforeStar = val.slice(0, i);
+                                if (!/(?:^|[^\\])(?:\\\\)*\\$/.test(beforeStar)) {
+                                    openItalicNode = curTn;
+                                    openItalicIdx = i;
+                                    break;
+                                }
+                            }
+                        }
+                        if (openItalicNode) break;
+                    }
+                }
+
+                const strong = document.createElement('strong');
+                strong.setAttribute('data-fixed-bold', 'true');
+
+                if (startNode === prevTextNode) {
+                    const boldText = prevTextNode.nodeValue.slice(lastBoldIdx + 2, punctIdx + 1);
+                    if (!boldText.trim()) return;
+                    strong.textContent = boldText;
+                } else {
+                    // 跨节点加粗（加粗内部含有 KaTeX 或其他行内节点）
+                    const startBoldSlice = startNode.nodeValue.slice(lastBoldIdx + 2);
+                    const endBoldSlice = prevTextNode.nodeValue.slice(0, punctIdx + 1);
+                    if (startBoldSlice) strong.appendChild(document.createTextNode(startBoldSlice));
+
+                    let s = startNode.nextSibling;
+                    while (s && s !== prevTextNode && !s.contains(prevTextNode)) {
+                        strong.appendChild(s);
+                        s = s.nextSibling;
+                    }
+                    if (endBoldSlice) strong.appendChild(document.createTextNode(endBoldSlice));
+                    if (!strong.textContent.trim()) return;
+                }
+
+                if (openItalicNode) {
+                    // 存在外层引用斜体开启符 *：重组为包含内部 strong 的外层引用 em
+                    const newEm = document.createElement('em');
+                    newEm.setAttribute('data-fixed-italic', 'true');
+
+                    if (openItalicNode === startNode) {
+                        const textBeforeItalic = beforeBold.slice(0, openItalicIdx);
+                        const quoteText = beforeBold.slice(openItalicIdx + 1);
+
+                        if (quoteText) {
+                            newEm.appendChild(document.createTextNode(quoteText));
+                        }
+                        newEm.appendChild(strong);
+                        while (em.firstChild) {
+                            newEm.appendChild(em.firstChild);
+                        }
+
+                        // 清理 newEm 内部末尾可能残留的孤立单星号
+                        const lastTn = getLastTextNode(newEm);
+                        if (lastTn && lastTn.nodeValue) {
+                            lastTn.nodeValue = lastTn.nodeValue.replace(/\s*\*+\s*$/, '');
+                        }
+
+                        startNode.nodeValue = textBeforeItalic;
+                        if (!textBeforeItalic) {
+                            if (startNode.parentNode === em.parentNode) {
+                                startNode.remove();
+                            } else if (startNode.parentNode && startNode.parentNode.childNodes.length === 1 && !startNode.parentNode.textContent.trim()) {
+                                startNode.parentNode.remove();
+                            }
+                        }
+                        if (prevTextNode !== startNode) {
+                            if (prevTextNode.parentNode === em.parentNode) {
+                                prevTextNode.remove();
+                            } else if (prevTextNode.parentNode && prevTextNode.parentNode.childNodes.length === 1 && !prevTextNode.parentNode.textContent.trim()) {
+                                prevTextNode.parentNode.remove();
+                            } else {
+                                prevTextNode.remove();
+                            }
+                        }
+
+                        em.parentNode.insertBefore(newEm, em);
+                        em.remove();
+                    } else {
+                        // openItalicNode 是更早的前置兄弟文本节点（例如 quote 开头有公式或其他内联节点）
+                        const textBeforeItalic = openItalicNode.nodeValue.slice(0, openItalicIdx);
+                        const quoteText = openItalicNode.nodeValue.slice(openItalicIdx + 1);
+
+                        openItalicNode.nodeValue = textBeforeItalic;
+                        if (quoteText) {
+                            newEm.appendChild(document.createTextNode(quoteText));
+                        }
+
+                        let pCur = openItalicNode.nextSibling;
+                        while (pCur && pCur !== startNode && !pCur.contains(startNode)) {
+                            newEm.appendChild(pCur);
+                            pCur = pCur.nextSibling;
+                        }
+
+                        if (beforeBold) {
+                            newEm.appendChild(document.createTextNode(beforeBold));
+                        }
+                        newEm.appendChild(strong);
+                        while (em.firstChild) {
+                            newEm.appendChild(em.firstChild);
+                        }
+
+                        const lastTn = getLastTextNode(newEm);
+                        if (lastTn && lastTn.nodeValue) {
+                            lastTn.nodeValue = lastTn.nodeValue.replace(/\s*\*+\s*$/, '');
+                        }
+
+                        if (startNode.parentNode === em.parentNode) {
+                            startNode.remove();
+                        } else if (startNode.parentNode && startNode.parentNode.childNodes.length === 1 && !startNode.parentNode.textContent.trim()) {
+                            startNode.parentNode.remove();
+                        }
+                        if (prevTextNode !== startNode) {
+                            if (prevTextNode.parentNode === em.parentNode) {
+                                prevTextNode.remove();
+                            } else if (prevTextNode.parentNode && prevTextNode.parentNode.childNodes.length === 1 && !prevTextNode.parentNode.textContent.trim()) {
+                                prevTextNode.parentNode.remove();
+                            }
+                        }
+
+                        em.parentNode.insertBefore(newEm, em);
+                        em.remove();
+                    }
+                } else {
+                    // 无外层斜体开启符：独立加粗，解构脱开伪 em
+                    if (startNode === prevTextNode) {
+                        prevTextNode.nodeValue = beforeBold;
+                        em.parentNode.insertBefore(strong, em);
+                        while (em.firstChild) {
+                            em.parentNode.insertBefore(em.firstChild, em);
+                        }
+                        em.remove();
+                    } else {
+                        startNode.nodeValue = beforeBold;
+                        if (prevTextNode.parentNode === em.parentNode) {
+                            prevTextNode.remove();
+                        } else if (prevTextNode.parentNode && prevTextNode.parentNode.childNodes.length === 1 && !prevTextNode.parentNode.textContent.trim()) {
+                            prevTextNode.parentNode.remove();
+                        }
+                        em.parentNode.insertBefore(strong, em);
+                        while (em.firstChild) {
+                            em.parentNode.insertBefore(em.firstChild, em);
+                        }
+                        em.remove();
+                    }
+                }
+            });
+        }
+
+        // 方案 B：针对解析器未生成任何 <em> 的纯文本引用块（如末尾缺失闭合 * 的 `> *"恭喜...**31337 (顶级精英) *黑客。”`）
+        // 检索 blockquote, .callout, p 等容器内的未解析裸星号引用
+        const quoteContainers = document.querySelectorAll(
+            'ms-cmark-node blockquote, ms-cmark-node blockquote p, ms-cmark-node .callout, ms-cmark-node .callout p, ms-cmark-node p, ' +
+            '.markdown-content blockquote, .markdown-content blockquote p, .markdown-content .callout, .markdown-content .callout p, .markdown-content p, ' +
+            'blockquote, blockquote p, .callout, .callout p'
+        );
+
+        quoteContainers.forEach((container) => {
+            if (container.closest && container.closest('pre, code, [data-fixed-italic]')) return;
+            const walker = document.createTreeWalker(container, NodeFilter ? NodeFilter.SHOW_TEXT : 4, null);
+            const rawTextNodes = [];
+            let tNode;
+            while ((tNode = walker.nextNode())) {
+                rawTextNodes.push(tNode);
+            }
+
+            const rawQuoteRegex = /(?<![\\*])\*(["“][^*]+?)\*\*([^*]+?[）)\]］｝}〉》】〕』」〗〙'"”’！？!?。.,，、;；:：…—\-]|\p{Unified_Ideograph}|\p{Script=Hiragana}|\p{Script=Katakana})(?:\s*\*{1,2}\s*|\*{1,2})([^*]+?["”]?)(?:\*|$)/u;
+
+            rawTextNodes.forEach((node) => {
+                if (!node.parentNode || !node.nodeValue) return;
+                if (node.parentNode.hasAttribute && (node.parentNode.hasAttribute('data-fixed-italic') || node.parentNode.hasAttribute('data-fixed-bold'))) return;
+                if (node.parentNode.closest && node.parentNode.closest('pre, code, ms-katex, [data-fixed-italic], [data-fixed-bold]')) return;
+
+                const match = node.nodeValue.match(rawQuoteRegex);
+                if (!match) return;
+
+                const matchStart = match.index;
+                const matchEnd = matchStart + match[0].length;
+                const beforeText = node.nodeValue.slice(0, matchStart);
+                const afterText = node.nodeValue.slice(matchEnd);
+
+                const quoteLead = match[1];
+                const boldContent = match[2];
+                const quoteTail = match[3];
+
+                const newEm = document.createElement('em');
+                newEm.setAttribute('data-fixed-italic', 'true');
+
+                if (quoteLead) {
+                    newEm.appendChild(document.createTextNode(quoteLead));
+                }
+
+                const strong = document.createElement('strong');
+                strong.setAttribute('data-fixed-bold', 'true');
+                strong.textContent = boldContent;
+                newEm.appendChild(strong);
+
+                if (quoteTail) {
+                    newEm.appendChild(document.createTextNode(quoteTail));
+                }
+
+                const parent = node.parentNode;
+                if (beforeText) {
+                    parent.insertBefore(document.createTextNode(beforeText), node);
+                }
+                parent.insertBefore(newEm, node);
+                if (afterText) {
+                    parent.insertBefore(document.createTextNode(afterText), node);
+                }
+                node.remove();
+            });
+        });
+    }
+
 
     // ==================== 5.2 修复 CJK 标点导致的泄露加粗标记 (**) 与多米诺错位反相 (v6.4 全覆盖状态机版) ====================
     // 根因：CommonMark 6.2 规范将「中文右括号/引号 + 汉字」（如 `（方案五）**筛选`）中的闭合 `**` 误判为左翼开启符（OPEN-only），
@@ -1543,8 +2474,11 @@
         const containerSelector =
             'ms-cmark-node p, ms-cmark-node li, ms-cmark-node td, ms-cmark-node th, ' +
             'ms-cmark-node h1, ms-cmark-node h2, ms-cmark-node h3, ms-cmark-node h4, ms-cmark-node h5, ms-cmark-node h6, ' +
-            'ms-cmark-node blockquote, .markdown-content p, .markdown-content li, .markdown-content td, .markdown-content th, ' +
-            '.markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6, .markdown-content blockquote';
+            'ms-cmark-node blockquote, ms-cmark-node blockquote p, ms-cmark-node .callout, ms-cmark-node .callout p, ' +
+            '.markdown-content p, .markdown-content li, .markdown-content td, .markdown-content th, ' +
+            '.markdown-content h1, .markdown-content h2, .markdown-content h3, .markdown-content h4, .markdown-content h5, .markdown-content h6, ' +
+            '.markdown-content blockquote, .markdown-content blockquote p, .markdown-content .callout, .markdown-content .callout p, ' +
+            'blockquote, blockquote p, .callout, .callout p';
         const subBlockTags = new Set(['p', 'li', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'ul', 'ol', 'table', 'pre', 'hr']);
         const skipInlineTags = new Set(['code', 'pre', 'ms-katex', 'annotation', 'script', 'style', 'svg', 'math']);
         const markerRegex = /(?<![\\*])\*\*(?!\*)/g;
@@ -1563,7 +2497,8 @@
                         if (
                             child.hasAttribute('data-ms-bold-seg') ||
                             child.hasAttribute('data-ms-math-seg') ||
-                            child.hasAttribute('data-ms-math-hidden')
+                            child.hasAttribute('data-ms-math-hidden') ||
+                            child.hasAttribute('data-ms-sub-tilde')
                         ) {
                             continue;
                         }
@@ -1684,7 +2619,8 @@
                         if (
                             child.hasAttribute('data-ms-bold-seg') ||
                             child.hasAttribute('data-ms-math-seg') ||
-                            child.hasAttribute('data-ms-math-hidden')
+                            child.hasAttribute('data-ms-math-hidden') ||
+                            child.hasAttribute('data-ms-sub-tilde')
                         ) {
                             continue;
                         }
@@ -1906,12 +2842,15 @@
     // ==================== 6. 统一执行与 DOM 监听调度 ====================
 
     function runAllFixes() {
-        fixBrokenCurrencyMath();
-        fixBrokenParagraphs();
-        fixBrokenTableRows();
-        fixBrokenSubscriptMarkdown();
-        fixBrokenBoldMarkdown();
-        syncWideTurnWidths();
+        fixBrokenCodeBlocks();             // 1. 最先解构伪代码块，使释放出来的段落无缝流入后续管线
+        fixBrokenCurrencyMath();           // 2. 还原美元货币假公式
+        fixBrokenParagraphs();             // 3. 修复段落 KaTeX 公式（自动渲染解构容器中的 $h_t$）
+        fixBrokenTableRows();              // 4. 修复 Markdown 表格公式与分块矩阵
+        fixBrokenTildeMarkdown();          // 5. 修复波浪号误伤（涵盖 sub 及具备数值区间的 del/s）
+        fixBrokenBiochemicalStarBold();    // 6. 修复生化/蛋白质星号命名加粗误拆（如 **A$\beta$*56**）
+        fixBrokenCjkPunctuationBold();     // 7. 修复 CJK 标点闭合加粗与斜体窃取补偿（如 *“...**31337（顶级精英）**黑客。”*）
+        fixBrokenBoldMarkdown();           // 8. 重配加粗状态机（自动加粗解构容器中的 **内容）
+        syncWideTurnWidths();              // 9. 虚拟滚动宽度对齐
     }
 
     let timer = null;
