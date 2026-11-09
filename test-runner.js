@@ -464,21 +464,27 @@ const scriptSource = fs.readFileSync(scriptPath, 'utf8');
 console.log('--- Test Suite 1: Script Header & Metadata Check ---');
 const versionMatch = scriptSource.match(/@version\s+([0-9.]+)/);
 assert.ok(versionMatch, 'Version header should exist');
-assert.strictEqual(versionMatch[1], '1.5.1', 'Version should be bumped to 1.5.1');
-console.log('✔ Version is correctly 1.5.1');
+assert.strictEqual(versionMatch[1], '1.6.0', 'Version should be bumped to 1.6.0');
+console.log('✔ Version is correctly 1.6.0');
 
 assert.ok(scriptSource.includes('fixBrokenCodeBlocks'), 'Script must define fixBrokenCodeBlocks');
 assert.ok(scriptSource.includes('fixBrokenTildeMarkdown'), 'Script must define fixBrokenTildeMarkdown');
 assert.ok(scriptSource.includes('fixBrokenBiochemicalStarBold'), 'Script must define fixBrokenBiochemicalStarBold');
 assert.ok(scriptSource.includes('fixBrokenCjkPunctuationBold'), 'Script must define fixBrokenCjkPunctuationBold');
-assert.ok(!scriptSource.includes('fixBrokenRetractionAndTruncation'), 'Flawed DOM level retraction wiper should be cleanly removed');
-assert.ok(!scriptSource.includes('function fixBrokenSubscriptMarkdown'), 'Old fixBrokenSubscriptMarkdown function definition should be removed');
-console.log('✔ Functions correctly named and old function removed\n');
+assert.ok(!scriptSource.includes('RETRACT_FINISH_REASONS'), 'RETRACT_FINISH_REASONS must be cleanly removed');
+assert.ok(!scriptSource.includes('_msHookedIncludes'), '_msHookedIncludes must be cleanly removed');
+assert.ok(!scriptSource.includes('recentlyDeletedModelChunks'), 'recentlyDeletedModelChunks must be cleanly removed');
+assert.ok(!scriptSource.includes('_msAntiRetraction'), '_msAntiRetraction flags must be cleanly removed');
+assert.ok(!scriptSource.includes('[防撤回保护生效]'), 'Retraction text injection must be cleanly removed');
+assert.ok(!scriptSource.includes('isUserInitiatedAction'), 'User action tracking must be cleanly removed');
+assert.ok(scriptSource.includes('chunkSnapshotCache'), 'chunkSnapshotCache must be preserved for O(1) performance');
+assert.ok(scriptSource.includes('cleanExpiredSnapshots'), 'cleanExpiredSnapshots must be preserved');
+console.log('✔ Functions correctly named and anti-retraction completely removed\n');
 
 // Wrap script in an evaluator that exposes private functions for testing
 const wrappedSource = scriptSource.replace(
     'function runAllFixes() {',
-    'global.__scriptInternals = { fixBrokenCodeBlocks, fixBrokenTildeMarkdown, fixBrokenBiochemicalStarBold, fixBrokenCjkPunctuationBold, fixBrokenParagraphs, fixBrokenBoldMarkdown, findRawLatexEnvBlock, collectRawLatexEnvsFromString, rawLatexEnvBlocks, isUserInitiatedAction, markUserAction, resetUserAction: () => { userActiveActionTs = 0; }, runAllFixes };\nfunction runAllFixes() {'
+    'global.__scriptInternals = { fixBrokenCodeBlocks, fixBrokenTildeMarkdown, fixBrokenBiochemicalStarBold, fixBrokenCjkPunctuationBold, fixBrokenParagraphs, fixBrokenBoldMarkdown, findRawLatexEnvBlock, collectRawLatexEnvsFromString, rawLatexEnvBlocks, chunkSnapshotCache, cleanExpiredSnapshots, rawMarkdownLines, runAllFixes };\nfunction runAllFixes() {'
 );
 
 try {
@@ -499,9 +505,9 @@ const {
     findRawLatexEnvBlock,
     collectRawLatexEnvsFromString,
     rawLatexEnvBlocks,
-    isUserInitiatedAction,
-    markUserAction,
-    resetUserAction,
+    chunkSnapshotCache,
+    cleanExpiredSnapshots,
+    rawMarkdownLines,
     runAllFixes
 } = global.__scriptInternals;
 
@@ -1930,373 +1936,88 @@ console.log('\n--- Test Suite 8: Figure 2 Requirements & Full Pipeline Integrati
 }
 
 // ----------------------------------------------------
-console.log('\n--- Test Suite 9: Anti-Retraction & Truncation Engine Tests ---');
+console.log('\n--- Test Suite 9: Performance Optimization & Data Stream Memory Caching Tests ---');
 
-// 9.1 AI Studio lJb Retraction Interception & Resurrect
+// 9.1 Data Stream Markdown Table Extraction without Chunk Mutation
 {
     const entitiesMap = new Map();
-    // Simulate active session
-    entitiesMap.set('text-input-chunk-id', { tb: 'text', role: 'user', text: '请介绍一下量子力学基本原理' });
+    const chunkId = 'chunk-table-extract-test';
+    const originalText = '| 矩阵类型 | 特征表达式 |\n|---|---|\n| 协方差矩阵 | $\\mathbf{\\Sigma} = \\mathbf{X}^T \\mathbf{X}$ |';
 
-    const chunk1Id = 'chunk-model-thought-01';
-    const chunk2Id = 'chunk-model-text-02';
-
-    // Model streams thinking and substantive text
-    entitiesMap.set(chunk1Id, {
-        id: chunk1Id,
-        tb: 'text',
+    entitiesMap.set(chunkId, {
+        id: chunkId,
         role: 'model',
-        thought: true,
-        text: '用户询问量子力学原理，需要从波函数、薛定谔方程、不确定性原理展开分析...',
-        timestamp: Date.now() - 2000
+        text: originalText,
+        timestamp: Date.now()
     });
 
-    entitiesMap.set(chunk2Id, {
-        id: chunk2Id,
-        tb: 'text',
-        role: 'model',
-        thought: false,
-        text: '量子力学是描述微观物质运动规律的物理学分支。其核心原理包括态叠加原理与不确定性原理。态叠加原理表明系统在测量前可处于多个本征态的线性叠加：$$\\psi = \\sum c_n \\phi_n$$',
-        timestamp: Date.now() - 1000
-    });
+    // 1) Chunk properties must not be mutated or tampered with
+    const stored = entitiesMap.get(chunkId);
+    assert.strictEqual(stored.text, originalText, 'Text must remain 100% identical to original model output');
+    assert.strictEqual(stored._msAntiRetractionRescued, undefined, 'No anti-retraction flags added');
 
-    // Simulate AI Studio lJb: deletes all model chunks in current turn
-    entitiesMap.delete(chunk1Id);
-    entitiesMap.delete(chunk2Id);
+    // 2) rawMarkdownLines must have cleanly extracted the complete table lines in memory
+    const hasRow = Array.from(rawMarkdownLines).some(l => l.includes('协方差矩阵'));
+    assert.ok(hasRow, 'Markdown table row must be extracted directly to rawMarkdownLines for table rendering fix');
 
-    // AI Studio creates a new UUID chunk with empty text and blacklist finishReason: 3 (SAFETY)
-    const newUUID = 'chunk-retracted-empty-99';
-    const emptyRetractionChunk = {
-        id: newUUID,
-        tb: 'text',
-        role: 'model',
-        Ul: false,
-        text: '',
-        tokenCount: 0,
-        Ub: 1,
-        Dl: {
-            finishReason: 3,
-            finishMessage: 'Blocked due to safety threshold',
-            safetyRatings: [{ category: 1, probability: 3 }]
-        }
-    };
-
-    entitiesMap.set(newUUID, emptyRetractionChunk);
-
-    // Assert: Anti-retraction engine must have intercepted and resurrected text
-    assert.strictEqual(emptyRetractionChunk._msAntiRetractionRescued, true, 'Chunk should be marked as rescued');
-    assert.ok(emptyRetractionChunk.text.includes('量子力学是描述微观物质运动规律的物理学分支'), 'Substantive text must be preserved');
-    assert.ok(emptyRetractionChunk.text.includes('态叠加原理'), 'Formulas and core explanation preserved');
-    assert.ok(emptyRetractionChunk.text.includes('💭 **[已救回的思考过程]**'), 'Thought markdown quote must be injected');
-    assert.ok(emptyRetractionChunk.text.includes('🛡️ **[防撤回保护生效]**'), 'Protection notice must be appended');
-    assert.strictEqual(emptyRetractionChunk.Dl.finishReason, 1, 'finishReason must be modified to normal STOP (1) to prevent Angular UI hiding');
-    assert.strictEqual(emptyRetractionChunk._originalDl.finishReason, 3, 'Original finishReason must be archived in _originalDl');
-
-    console.log('✔ Case 9.1 Passed: lJb retraction intercepted, text resurrected, thought preserved, and finishReason normalized');
+    console.log('✔ Case 9.1 Passed: Map.set extracted Markdown table lines directly into memory buffer without tampering');
 }
 
-// 9.2 Pure Thought Stage Retraction Resurrect
+// 9.2 Data Stream LaTeX Environment Extraction for Formula Stitching
 {
     const entitiesMap = new Map();
-    const thoughtChunkId = 'chunk-early-thought-only';
+    const chunkId = 'chunk-latex-env-extract-test';
+    const latexText = '推导过程如下：\n$$\\begin{pmatrix} 1 & 0 \\\\ 0 & 1 \\end{pmatrix}$$\n请继续计算。';
 
-    // Model streams thought, but triggers finishReason before any text is outputted
-    entitiesMap.set(thoughtChunkId, {
-        id: thoughtChunkId,
-        tb: 'text',
+    entitiesMap.set(chunkId, {
+        id: chunkId,
         role: 'model',
-        thought: true,
-        text: '正在推演超导磁悬浮中的迈斯纳效应公式...',
-        timestamp: Date.now() - 1000
+        text: latexText,
+        timestamp: Date.now()
     });
 
-    entitiesMap.delete(thoughtChunkId);
+    const hasEnv = Array.from(rawLatexEnvBlocks).some(b => b.includes('\\begin{pmatrix}'));
+    assert.ok(hasEnv, 'LaTeX environment must be extracted directly to rawLatexEnvBlocks for cross-block formula stitching');
 
-    const newChunkId = 'chunk-thought-retracted-empty';
-    const emptyChunk = {
-        id: newChunkId,
-        tb: 'text',
-        role: 'model',
-        Ul: false,
-        text: '',
-        tokenCount: 0,
-        Ub: 1,
-        Dl: { finishReason: 4, finishMessage: 'Recitation' }
-    };
-
-    entitiesMap.set(newChunkId, emptyChunk);
-
-    assert.strictEqual(emptyChunk._msAntiRetractionRescued, true);
-    assert.ok(emptyChunk.text.includes('正在推演超导磁悬浮中的迈斯纳效应公式'));
-    assert.ok(emptyChunk.text.includes('模型在思考阶段被中断撤回，已完整保留思考内容'));
-
-    console.log('✔ Case 9.2 Passed: Thought-only stage retraction rescued and displayed cleanly');
+    console.log('✔ Case 9.2 Passed: Map.set extracted LaTeX environments into rawLatexEnvBlocks without tampering');
 }
 
-// 9.3 WIb Overwrite Blanking Guard
+// 9.3 chunkSnapshotCache Memory Management & FIFO Eviction
 {
-    const entitiesMap = new Map();
-    const modelChunkId = 'chunk-long-standing-answer';
+    // Snapshot cache should store latest model chunk text
+    const snap = chunkSnapshotCache.get('chunk-latex-env-extract-test');
+    assert.ok(snap, 'Snapshot must be stored in chunkSnapshotCache');
+    assert.strictEqual(snap.role, 'model');
+    assert.ok(snap.text.includes('\\begin{pmatrix}'));
 
-    const longAnswer = '这是 Gemini 生成的高维相对论时空几何方程推导：$$G_{\\mu\\nu} + \\Lambda g_{\\mu\\nu} = \\frac{8\\pi G}{c^4} T_{\\mu\\nu}$$';
-    entitiesMap.set(modelChunkId, {
-        id: modelChunkId,
-        tb: 'text',
-        role: 'model',
-        text: longAnswer,
-        timestamp: Date.now() - 3000
-    });
+    // Test cleanExpiredSnapshots: artificially populate > 2500 entries
+    for (let i = 0; i < 2600; i++) {
+        chunkSnapshotCache.set(`dummy-test-key-${i}`, { role: 'model', text: 'dummy' });
+        cleanExpiredSnapshots();
+    }
+    assert.ok(chunkSnapshotCache.size <= 2500, `Cache size must be bounded at 2500, was ${chunkSnapshotCache.size}`);
 
-    // Simulate WIb resetting text: "" during an unexpected stream reconnect
-    const overwriteAttempt = {
-        id: modelChunkId,
-        tb: 'text',
-        role: 'model',
-        text: '',
-        Di: []
-    };
-
-    entitiesMap.set(modelChunkId, overwriteAttempt);
-
-    // Assert: overwrite should be rejected, preserving existing long text
-    assert.strictEqual(overwriteAttempt.text, longAnswer, 'Text must not be wiped out by WIb reconnect reset');
-    assert.strictEqual(overwriteAttempt._msAntiRetractionPreserved, true, 'Flagged as preserved');
-
-    console.log('✔ Case 9.3 Passed: WIb accidental overwrite blanking strictly guarded');
-}
-
-// 9.4 User-Initiated Delete Action Respected
-{
-    const entitiesMap = new Map();
-    const userDeletedChunkId = 'chunk-user-wants-to-delete';
-
-    entitiesMap.set(userDeletedChunkId, {
-        id: userDeletedChunkId,
-        tb: 'text',
-        role: 'model',
-        text: '这是一段用户准备重新运行或删除的内容',
-        timestamp: Date.now() - 1000
-    });
-
-    // Simulate user clicking delete / rerun button
-    const mockDeleteButton = mockDoc.createElement('button');
-    mockDeleteButton.className = 'delete-turn-button';
-    mockDoc.body.appendChild(mockDeleteButton);
-
-    const clickEvent = { target: mockDeleteButton };
-    // Dispatch to mock window listener
-    for (const listener of global.window._listeners.click || []) {
-        listener(clickEvent);
+    // Cleanup dummy keys
+    for (let i = 0; i < 2600; i++) {
+        chunkSnapshotCache.delete(`dummy-test-key-${i}`);
     }
 
-    // Now delete chunk and set empty chunk
-    entitiesMap.delete(userDeletedChunkId);
-
-    const userClearedChunk = {
-        id: 'chunk-fresh-start',
-        tb: 'text',
-        role: 'model',
-        text: '',
-        Dl: { finishReason: 1 }
-    };
-
-    entitiesMap.set('chunk-fresh-start', userClearedChunk);
-
-    // Assert: User action must be respected, no false positive rescue
-    assert.strictEqual(userClearedChunk._msAntiRetractionRescued, undefined, 'User action must not be falsely rescued');
-    assert.strictEqual(userClearedChunk.text, '', 'User-initiated empty chunk remains empty');
-
-    console.log('✔ Case 9.4 Passed: User-initiated deletion respected with zero false positives');
+    console.log('✔ Case 9.3 Passed: chunkSnapshotCache bounds and FIFO eviction properly enforced');
 }
 
-// 9.5 Virtual Scroll Unmount & Dynamic Reflow Immunity Test
+// 9.4 Array.prototype.includes Native Behavior Preserved (No Hijacking)
 {
-    mockDoc.body.childNodes = [];
-    // Simulate real AI Studio virtual-scroll-container hierarchy from saved HTML
-    const turn = mockDoc.createElement('ms-chat-turn');
-    turn.className = 'text-chunk-host';
+    const testArr = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17];
+    // Must return true per native ECMA-262 specification
+    assert.strictEqual(testArr.includes(3), true, 'Array.prototype.includes must be native and return true for element 3');
+    assert.strictEqual(testArr.includes(8), true, 'Array.prototype.includes must be native and return true for element 8');
+    assert.strictEqual(testArr.includes(99), false, 'Array.prototype.includes returns false for missing element');
+    assert.strictEqual(Array.prototype._msHookedIncludes, undefined, '_msHookedIncludes must be undefined');
 
-    const vsc = mockDoc.createElement('div');
-    vsc.className = 'virtual-scroll-container model-prompt-container';
-    vsc.setAttribute('data-turn-role', 'Model');
-
-    // Spacer div for off-screen height maintenance
-    const spacer = mockDoc.createElement('div');
-    spacer.style.height = '349.6px';
-    vsc.appendChild(spacer);
-
-    // Off-screen unmounted turn content
-    const tc = mockDoc.createElement('div');
-    tc.className = 'turn-content';
-    tc.innerHTML = ''; // completely empty when unmounted off-screen
-    tc.textContent = '';
-    vsc.appendChild(tc);
-
-    turn.appendChild(vsc);
-    mockDoc.body.appendChild(turn);
-
-    // Execute full pipeline
-    runAllFixes();
-
-    // Verify: No false-positive DOM rescue banners injected
-    assert.strictEqual(turn.dataset.msDomRescued, undefined, 'Turn must never be falsely marked as rescued');
-    assert.strictEqual(mockDoc.querySelectorAll('.ms-dom-anti-retraction-banner').length, 0, 'Zero false retraction banners injected');
-    assert.strictEqual(tc.textContent, '', 'Unmounted off-screen turn remains cleanly unmounted');
-
-    console.log('✔ Case 9.5 Passed: Virtual Scroll unmount immunity verified with 100% precision');
+    console.log('✔ Case 9.4 Passed: Array.prototype.includes is 100% native and untampered');
 }
 
-// 9.6 Latest Closure Compiler Obfuscation Structure (HJ-037 / boq_alkali-makersuite_20261106.02_p0)
-{
-    resetUserAction();
-    const entitiesMap = new Map();
-    const thoughtId = 'chunk-hj037-thought';
-    const textId = 'chunk-hj037-main';
-
-    // Model streams thought and text
-    entitiesMap.set(thoughtId, {
-        id: thoughtId,
-        yb: 'text',
-        role: 'model',
-        thought: true,
-        ln: true,
-        text: '正在检索 HJ-037 系列的详细信息并整理演员阵容与出品信息...',
-        timestamp: Date.now() - 2000
-    });
-
-    entitiesMap.set(textId, {
-        id: textId,
-        yb: 'text',
-        role: 'model',
-        thought: false,
-        ln: false,
-        text: 'HJ-037 是著名的作品系列。以下是整理后的作品详情与演员阵容列表：\n| 编号 | 作品名 | 主演 |\n|---|---|---|\n| HJ-037-1 | 作品一 | 演员A |',
-        timestamp: Date.now() - 1000
-    });
-
-    // Simulate AI Studio AOb / lJb: deletes all chunks
-    entitiesMap.delete(thoughtId);
-    entitiesMap.delete(textId);
-
-    // AI Studio inserts empty chunk with obfuscated properties from m=_b_t56s:
-    // v.Mm (instead of v.Dl), v.Ej (instead of v.Di), v.ln (instead of v.Ul), v.lc (instead of v.Ub), finishReason: 8 (PROHIBITED_CONTENT)
-    const newUUID = 'BCE0F7FB-7111-4175-AFB9-C70ED184A508';
-    const emptyRetractionChunk = {
-        id: newUUID,
-        yb: 'text',
-        ln: false,
-        role: 'model',
-        timestamp: Date.now(),
-        text: '',
-        tokenCount: 0,
-        lc: 1,
-        Ej: [],
-        Mm: {
-            finishReason: 8,
-            finishMessage: 'Prohibited content',
-            safetyRatings: [{ category: 2, probability: 3 }]
-        }
-    };
-
-    entitiesMap.set(newUUID, emptyRetractionChunk);
-
-    assert.strictEqual(emptyRetractionChunk._msAntiRetractionRescued, true, 'Must rescue chunk with new v.Mm obfuscation');
-    assert.ok(emptyRetractionChunk.text.includes('HJ-037 是著名的作品系列'), 'Main text must be rescued');
-    assert.ok(emptyRetractionChunk.text.includes('正在检索 HJ-037 系列的详细信息'), 'Thinking process must be rescued');
-    assert.ok(emptyRetractionChunk.text.includes('🛡️ **[防撤回保护生效]**'), 'Protection notice must be attached');
-    assert.strictEqual(emptyRetractionChunk.Mm.finishReason, 1, 'finishReason in v.Mm must be normalized to 1');
-    assert.strictEqual(emptyRetractionChunk._originalDl.finishReason, 8, 'Original finishReason 8 must be saved in _originalDl');
-
-    console.log('✔ Case 9.6 Passed: Latest Closure Compiler obfuscation (v.Mm, v.Ej, finishReason: 8) rescued with 100% precision');
-}
-
-// 9.7 Layer 1 Array.prototype.includes Interception (wNb / jIb)
-{
-    resetUserAction();
-    const wNb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17];
-
-    // Under automatic AI Studio retraction, includes(8) or includes(3) must return false
-    assert.strictEqual(wNb.includes(8), false, 'wNb.includes(8) must return false to guide AOb into else branch');
-    assert.strictEqual(wNb.includes(3), false, 'wNb.includes(3) must return false');
-
-    // Normal arrays must remain completely untouched
-    assert.strictEqual([1, 2, 3].includes(2), true, 'Normal array includes must work as expected');
-    assert.strictEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].includes(8), true, 'Different array signature must work as normal');
-
-    // When user initiates an action, wNb.includes must return true
-    const mockButton = mockDoc.createElement('button');
-    mockButton.className = 'delete-turn-button';
-    mockDoc.body.appendChild(mockButton);
-    for (const listener of global.window._listeners.click || []) {
-        listener({ target: mockButton });
-    }
-    assert.strictEqual(wNb.includes(8), true, 'User initiated action allows normal includes');
-    resetUserAction();
-
-    console.log('✔ Case 9.7 Passed: Layer 1 Array.prototype.includes interception guard verified');
-}
-
-// 9.8 Multiple Thought Chunks Preservation in Chronological Order
-{
-    const entitiesMap = new Map();
-    const thought1 = 'chunk-thought-step-1';
-    const thought2 = 'chunk-thought-step-2';
-    const thought3 = 'chunk-thought-step-3';
-    const mainChunk = 'chunk-main-response';
-
-    entitiesMap.set(thought1, {
-        id: thought1,
-        role: 'model',
-        thought: true,
-        text: '步骤 1：分析用户提问，准备执行第 1 次搜索...',
-        timestamp: Date.now() - 3000
-    });
-    entitiesMap.set(thought2, {
-        id: thought2,
-        role: 'model',
-        thought: true,
-        text: '步骤 2：第 1 次搜索返回结果不全面，发起第 2 次深度搜索...',
-        timestamp: Date.now() - 2000
-    });
-    entitiesMap.set(thought3, {
-        id: thought3,
-        role: 'model',
-        thought: true,
-        text: '步骤 3：综合多次搜索结果，开始构建回答...',
-        timestamp: Date.now() - 1000
-    });
-    entitiesMap.set(mainChunk, {
-        id: mainChunk,
-        role: 'model',
-        thought: false,
-        text: '这是综合多次思考后的最终回答正文。',
-        timestamp: Date.now() - 500
-    });
-
-    entitiesMap.delete(thought1);
-    entitiesMap.delete(thought2);
-    entitiesMap.delete(thought3);
-    entitiesMap.delete(mainChunk);
-
-    const emptyChunk = {
-        id: 'chunk-all-deleted',
-        role: 'model',
-        text: '',
-        Mm: { finishReason: 8 }
-    };
-    entitiesMap.set('chunk-all-deleted', emptyChunk);
-
-    assert.ok(emptyChunk.text.includes('步骤 1：分析用户提问'), 'Step 1 thought preserved');
-    assert.ok(emptyChunk.text.includes('步骤 2：第 1 次搜索返回结果不全面'), 'Step 2 thought preserved');
-    assert.ok(emptyChunk.text.includes('步骤 3：综合多次搜索结果'), 'Step 3 thought preserved');
-    assert.ok(emptyChunk.text.includes('这是综合多次思考后的最终回答正文'), 'Final answer text preserved');
-    assert.ok(emptyChunk.text.indexOf('步骤 1') < emptyChunk.text.indexOf('步骤 2'), 'Order: step 1 before step 2');
-    assert.ok(emptyChunk.text.indexOf('步骤 2') < emptyChunk.text.indexOf('步骤 3'), 'Order: step 2 before step 3');
-
-    console.log('✔ Case 9.8 Passed: Multiple thought chunks preserved in chronological order');
-}
-
-// 9.9 Map.prototype.set O(1) Reference Equality Fast Path Performance
+// 9.5 Map.prototype.set O(1) Reference Equality Fast Path Performance
 {
     const map = new Map();
     for (let i = 0; i < 100; i++) {
@@ -2316,7 +2037,7 @@ console.log('\n--- Test Suite 9: Anti-Retraction & Truncation Engine Tests ---')
     const duration = Date.now() - tStart;
     assert.ok(duration < 250, `100,000 Map.set calls should finish in <250ms, took ${duration}ms`);
 
-    console.log(`✔ Case 9.9 Passed: 100,000 Map.set fast-path calls completed in ${duration}ms (true O(1) performance)`);
+    console.log(`✔ Case 9.5 Passed: 100,000 Map.set fast-path calls completed in ${duration}ms (true O(1) performance)`);
 }
 
 // 7.17 Cross-Paragraph DOM Isolation (Bug 1 Fix Verification)
@@ -2567,136 +2288,18 @@ $$\\begin{array}{rccccccc}
 }
 
 // ----------------------------------------------------
-console.log('\n--- Test Suite 11: Mobile Stuck Loading & Safety Retraction Closure Tests (v1.5.1) ---');
+console.log('\n--- Test Suite 11: End-to-End Native Compatibility & Content Integrity ---');
 
-// 11.1 Zero-Content Safety Block Interception (Screenshot exact case: safety refusal with text: "")
+// 11.1 Native Stream Completion & Content Integrity
 {
-    resetUserAction();
-    const entities = new Map();
-    const chunkId = 'model-chunk-safety-zero-content-' + Date.now();
-    const interceptedChunk = {
-        id: chunkId,
-        role: 'model',
-        yb: 'text',
-        ln: true,
-        text: '',
-        tokenCount: 0,
-        lc: 1,
-        Mm: {
-            finishReason: 3, // SAFETY
-            finishMessage: 'SAFETY_VIOLATION'
-        }
-    };
-
-    // Simulate AI Studio setting chunk into entities map
-    entities.set(chunkId, interceptedChunk);
-
-    // Verifications:
-    // 1) ln must be strictly closed to false (terminating the "処理しています" loading spinner)
-    assert.strictEqual(interceptedChunk.ln, false, 'Loading flag ln must be closed to false');
-    assert.strictEqual(interceptedChunk.Ul, false, 'Streaming flag Ul must be closed to false');
-
-    // 2) text must be populated with a helpful safety notification rather than left empty
-    assert.ok(interceptedChunk.text.includes('[内容被系统安全策略拦截]'), 'Safety notice must be injected');
-    assert.ok(interceptedChunk.text.includes('3'), 'Finish reason code must be shown');
-
-    // 3) finishReason must be normalized to STOP (1) and incomplete set to false so Angular stops spinning
-    assert.strictEqual(interceptedChunk.incomplete, false, 'incomplete flag must be false');
-    assert.strictEqual(interceptedChunk.Mm.finishReason, 1, 'finishReason must be normalized to 1');
-
-    console.log('✔ Case 11.1 Passed: Zero-content safety interception closed loading state and injected helpful notice');
-}
-
-// 11.2 Prohibited Content Interception with No Deleted Chunks (Layer 1 else branch routing)
-{
-    resetUserAction();
-    const entities = new Map();
-    const chunkId = 'model-chunk-prohibited-zero-content-' + Date.now();
-    const interceptedChunk = {
-        id: chunkId,
-        role: 'model',
-        yb: 'text',
-        ln: true,
-        text: '',
-        Dl: {
-            finishReason: 8, // PROHIBITED_CONTENT
-            finishMessage: 'PROHIBITED'
-        }
-    };
-
-    entities.set(chunkId, interceptedChunk);
-
-    assert.strictEqual(interceptedChunk.ln, false, 'Loading flag ln must be closed to false');
-    assert.ok(interceptedChunk.text.includes('[内容被系统安全策略拦截]'), 'Notice must be injected');
-    assert.ok(interceptedChunk.text.includes('8'), 'Prohibited code 8 must be shown');
-    assert.strictEqual(interceptedChunk.Dl.finishReason, 1, 'finishReason must be normalized');
-
-    console.log('✔ Case 11.2 Passed: Prohibited content zero-content interception gracefully handled');
-}
-
-// 11.3 Partial Text Generation Followed by Abnormal Interruption
-{
-    resetUserAction();
-    const entities = new Map();
-    const chunkId = 'model-chunk-partial-text-' + Date.now();
-    const partialChunk = {
-        id: chunkId,
-        role: 'model',
-        yb: 'text',
-        ln: true,
-        text: '关于该历史人物的考证，经查证史料记载如下：',
-        Mm: {
-            finishReason: 3, // SAFETY interruption during streaming
-            finishMessage: 'SAFETY'
-        }
-    };
-
-    entities.set(chunkId, partialChunk);
-
-    // 1) ln must be false
-    assert.strictEqual(partialChunk.ln, false, 'Loading flag ln must be closed to false');
-    // 2) Original partial text must be preserved
-    assert.ok(partialChunk.text.startsWith('关于该历史人物的考证'), 'Original partial text must be kept');
-    // 3) Protective notice appended
-    assert.ok(partialChunk.text.includes('[防撤回保护生效]'), 'Retraction protection notice must be appended');
-    assert.strictEqual(partialChunk.Mm.finishReason, 1, 'finishReason normalized to 1');
-
-    console.log('✔ Case 11.3 Passed: Partial generated text preserved and loading state released on safety interruption');
-}
-
-// 11.4 Mobile Keyboard & Touch User Action Detection
-{
-    resetUserAction();
-    assert.strictEqual(isUserInitiatedAction(), false, 'Should be inactive initially');
-
-    // 1) Mobile virtual keyboard Enter keydown
-    markUserAction({ type: 'keydown', key: 'Enter', keyCode: 13 });
-    assert.strictEqual(isUserInitiatedAction(), true, 'Virtual keyboard Enter must be recognized as user-initiated action');
-
-    // 2) Reset and test touchstart on <ms-run-button>
-    resetUserAction();
-    assert.strictEqual(isUserInitiatedAction(), false, 'Reset successfully');
-
-    const fakeRunBtn = {
-        closest: (selector) => selector.includes('ms-run-button') ? true : null
-    };
-    markUserAction({ type: 'touchstart', target: fakeRunBtn });
-    assert.strictEqual(isUserInitiatedAction(), true, 'Touchstart on ms-run-button must be recognized as user-initiated action');
-
-    console.log('✔ Case 11.4 Passed: Mobile virtual keyboard Enter and touch actions reliably recognized');
-}
-
-// 11.5 Normal Generation Stream Completion releases ln
-{
-    resetUserAction();
     const entities = new Map();
     const chunkId = 'model-chunk-normal-completion-' + Date.now();
     const normalChunk = {
         id: chunkId,
         role: 'model',
         yb: 'text',
-        ln: true,
-        text: '这是正常的回答内容。',
+        ln: false,
+        text: '这是正常的回答内容，包含公式 $E=mc^2$ 与表格行 | A | B |。',
         Mm: {
             finishReason: 1 // STOP
         }
@@ -2704,10 +2307,11 @@ console.log('\n--- Test Suite 11: Mobile Stuck Loading & Safety Retraction Closu
 
     entities.set(chunkId, normalChunk);
 
-    assert.strictEqual(normalChunk.ln, false, 'Normal stream completion with finishReason: 1 must release ln to false');
-    assert.strictEqual(normalChunk.text, '这是正常的回答内容。', 'Normal text preserved intact');
+    assert.strictEqual(normalChunk.text, '这是正常的回答内容，包含公式 $E=mc^2$ 与表格行 | A | B |。', 'Normal text preserved intact');
+    assert.strictEqual(normalChunk.Mm.finishReason, 1, 'finishReason preserved as native 1');
+    assert.strictEqual(normalChunk._msAntiRetractionRescued, undefined, 'No retraction modification');
 
-    console.log('✔ Case 11.5 Passed: Normal stream completion releases loading flag cleanly');
+    console.log('✔ Case 11.1 Passed: Native model stream output preserved with 100% integrity');
 }
 
 console.log('\n=========================================');

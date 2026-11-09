@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Google AI Studio - LaTeX and Markdown Render Fix
-// @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复 (含防撤回/防截断)
-// @name:ja      Google AI Studio 数式＆Markdownレンダリング修正 (リトラクション防止)
+// @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复
+// @name:ja      Google AI Studio 数式＆Markdownレンダリング修正
 // @namespace    https://github.com/m1kuk1m/google-aistudio-latex-markdown-fix
-// @version      1.5.1
-// @description  Fixes AI Studio output retraction and truncation, mobile streaming loading freeze ("処理しています" / thinking hang), LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, CJK punctuation formatting glitches, and cross-block formula splits in Google AI Studio.
-// @description:zh-CN 修复与防护 Google AI Studio 上的回答意外截断与敏感词整段撤回、手机端流式长久卡死在等待回复（処理しています/思考脉冲动画与Stop按钮锁死）、Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆、CJK 标点斜体窃取排版及多行 LaTeX 公式跨块劈裂问题
-// @description:ja Google AI Studioにおける回答の意図しない切断・取り消し（リトラクション）の防止、モバイル環境での「処理しています」永久停止の解消、数式テーブルの途切れ、分割行列の縦线欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合、リスト構文による数式分断を修正します
+// @version      1.6.0
+// @description  Fixes LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, CJK punctuation formatting glitches, and cross-block formula splits in Google AI Studio.
+// @description:zh-CN 修复 Google AI Studio 上的 Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆、CJK 标点斜体窃取排版及多行 LaTeX 公式跨块劈裂问题
+// @description:ja Google AI Studioにおける数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合、リスト構文による数式分断を修正します
 // @author       m1kuk1m
 // @match        https://aistudio.google.com/*
 // @require      https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js
@@ -23,126 +23,23 @@
     // 0. 环境桥接：安全获取真实页面 window 对象（兼容 Firefox Xray Vision 与各类油猴运行模式）
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (typeof window !== 'undefined' ? window : globalThis);
 
-    // ==================== 1. 全域防撤回与防截断保护系统 (Anti-Retraction & Truncation Engine) ====================
-    // 背景：AI Studio 在流式生成结束或检测到特定安全/异常码 (finishReason 处于黑名单 wNb/jIb 中) 时，
-    // 前端 AOb/lJb 会清空本轮所有 model chunk 并替换为 text: "" 的空块，甚至导致已输出的长文本和思考过程被整段撤回蒸发；
-    // 本引擎在双层架构中提供防护：
-    //   第 1 层（源头拦截）：拦截 Array.prototype.includes 签名守卫，引导 AOb/lJb 走原生保留分支（零开销保留原生 <ms-thought-chunk> 与正文）；
-    //   第 2 层（数据层兜底）：动态特征识别 finishReason 属性（不依赖 Closure Compiler 属性混淆名 v.Dl/v.Mm），在 Map.set/delete 拦截清空并复活内容。
+    // ==================== 1. 原始 Markdown/LaTeX 缓冲池与 Angular 状态层监听 (Data Stream & Memory Cache) ====================
+    // 背景与性能架构：
+    // AI Studio 使用 Angular NgRx/Signals 管理模型输出实体 (entities Map)。
+    // 本模块通过轻量监听 Map.prototype.set：
+    //   1. 性能极速通道：克隆 Map 时对象引用相同则 O(1) 立即返回，无任何额外性能开销；
+    //   2. 内存实时采集：直接从流式模型 chunk 提取完整 Markdown 表格行与 LaTeX 环境，
+    //      彻底消除昂贵的全网络流克隆与 12 层 Angular LView 递归反射；
+    //   3. 内存快照缓存：维护 chunkSnapshotCache，供 findRawTableLine 与 findRawLatexEnvBlock 极速内存检索。
 
-    // AI Studio 官方触发撤回的 finishReason 黑名单 (对应官方源码 wNb/jIb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17])
-    const RETRACT_FINISH_REASONS = new Set([3, 4, 5, 7, 8, 9, 11, 14, 15, 17]);
-
-    // 用户主动操作时间戳（用于区分用户主动点击清空/删除/重试/发送 与 系统的被动抽风撤回）
-    let userActiveActionTs = 0;
-    const isUserInitiatedAction = () => (Date.now() - userActiveActionTs) < 1500;
-    const markUserAction = (e) => {
-        try {
-            // 移动端软键盘/输入法回车或提交快捷键支持
-            if (e && (e.type === 'keydown' || e.type === 'keyup')) {
-                if (e.key === 'Enter' || e.keyCode === 13) {
-                    userActiveActionTs = Date.now();
-                    return;
-                }
-            }
-
-            const target = e && e.target;
-            if (!target || typeof target.closest !== 'function') return;
-            if (target.closest('button, [role="button"], mat-icon, ms-run-button, ms-prompt-run-button, .run-button, .delete-turn-button, [aria-label*="delete" i], [aria-label*="clear" i], [aria-label*="edit" i], [aria-label*="rerun" i], [aria-label*="run" i], [aria-label*="send" i]')) {
-                userActiveActionTs = Date.now();
-            }
-        } catch (_) {}
-    };
-
-    const attachActionListeners = (targetWin) => {
-        if (!targetWin || typeof targetWin.addEventListener !== 'function') return;
-        targetWin.addEventListener('click', markUserAction, true);
-        targetWin.addEventListener('pointerdown', markUserAction, true);
-        targetWin.addEventListener('touchstart', markUserAction, { capture: true, passive: true });
-        targetWin.addEventListener('keydown', markUserAction, true);
-    };
-    attachActionListeners(win);
-    if (typeof window !== 'undefined' && window !== win) {
-        attachActionListeners(window);
-    }
-
-    // ---------------- 第 1 层：Array.prototype.includes 源头签名守卫 ----------------
-    // 在 AI Studio 打包核心中，11 个元素的错误码数组 [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17]（wNb/jIb）
-    // 唯一用途就是在 AOb/lJb 中执行 wNb.includes(g.finishReason)。
-    // 拦截该调用使其在非用户主动操作时返回 false，AI Studio 会原生走 else 分支，保留所有原生思考面板与正文！
-    const hookArrayPrototype = (targetProto) => {
-        if (!targetProto || targetProto._msHookedIncludes) return;
-        targetProto._msHookedIncludes = true;
-        const origIncludes = targetProto.includes;
-        targetProto.includes = function (searchElement, fromIndex) {
-            const res = origIncludes.apply(this, arguments);
-            if (!res) return false;
-            if (
-                typeof searchElement === 'number' &&
-                RETRACT_FINISH_REASONS.has(searchElement) &&
-                this.length === 11 &&
-                this[0] === 0 &&
-                this[1] === 3 &&
-                this[2] === 4 &&
-                this[10] === 17
-            ) {
-                if (!isUserInitiatedAction()) {
-                    try {
-                        console.info(`[AI Studio Fix] 🛡️ (第1层) 成功拦截 AOb/lJb 撤回判断 (finishReason: ${searchElement})，原生保留全部思考与正文块`);
-                    } catch (_) {}
-                    return false;
-                }
-            }
-            return res;
-        };
-    };
-    hookArrayPrototype(win.Array ? win.Array.prototype : (typeof Array !== 'undefined' ? Array.prototype : null));
-    if (typeof window !== 'undefined' && window !== win && window.Array && window.Array.prototype) {
-        hookArrayPrototype(window.Array.prototype);
-    }
-    if (typeof Array !== 'undefined' && Array.prototype) {
-        hookArrayPrototype(Array.prototype);
-    }
-
-    // 影子快照池：记录所有 model 实体块的最新有效文本及部件快照
+    // 影子快照池：记录 model 实体块的最新有效文本快照 (上限 2500 条)
     const chunkSnapshotCache = new Map();
-    // 救援池：暂存刚刚被 delete 的 model 块（键为 chunkId，值为快照与删除时间）
-    const recentlyDeletedModelChunks = new Map();
 
     function cleanExpiredSnapshots() {
-        const now = Date.now();
-        for (const [id, rec] of recentlyDeletedModelChunks.entries()) {
-            if (now - rec.deletedAt > 8000) {
-                recentlyDeletedModelChunks.delete(id);
-            }
-        }
         if (chunkSnapshotCache.size > 2500) {
             const oldestKey = chunkSnapshotCache.keys().next().value;
             chunkSnapshotCache.delete(oldestKey);
         }
-    }
-
-    // 动态提取/设置 chunk 的结束元数据（兼容 Closure Compiler 混淆更新：旧版 v.Dl，新版 v.Mm，以及未来任意混淆名）
-    function getChunkFinishMeta(v) {
-        if (!v || typeof v !== 'object') return null;
-        if (v.Mm && (typeof v.Mm.finishReason !== 'undefined' || Array.isArray(v.Mm.safetyRatings))) return { key: 'Mm', meta: v.Mm };
-        if (v.Dl && (typeof v.Dl.finishReason !== 'undefined' || Array.isArray(v.Dl.safetyRatings))) return { key: 'Dl', meta: v.Dl };
-        for (const k of Object.keys(v)) {
-            const val = v[k];
-            if (val && typeof val === 'object' && !Array.isArray(val)) {
-                if (typeof val.finishReason !== 'undefined' || Array.isArray(val.safetyRatings)) {
-                    return { key: k, meta: val };
-                }
-            }
-        }
-        return null;
-    }
-
-    function setChunkFinishMeta(v, newProps) {
-        if (!v || typeof v !== 'object') return;
-        const current = getChunkFinishMeta(v);
-        const targetKey = current ? current.key : (v.Mm ? 'Mm' : 'Dl');
-        v[targetKey] = Object.assign({}, v[targetKey], newProps);
     }
 
     // 原始 Markdown 缓冲池与 Angular LView 映射存储 (弱引用避免内存泄漏)
@@ -150,45 +47,16 @@
     const lViewMapRefs = [];
     const seenMaps = new WeakSet();
 
-    // 钩子 E: 拦截 Map 原型方法（同时守护 Angular LView 映射表与防撤回 entities 数据流）
+    // 钩子 E: 拦截 Map 原型 set 方法（记录 Angular LView 映射表与极速收集原始数据流）
     const hookMapPrototype = (targetMap) => {
         if (!targetMap || !targetMap.prototype) return;
         const origMapSet = targetMap.prototype.set;
-        const origMapDelete = targetMap.prototype.delete;
 
-        // 拦截 delete: 当实体块被 AOb/lJb 或 WIb 删除时，迅速打入救援池与当前 Map 实例暂存
-        if (typeof origMapDelete === 'function' && !targetMap.prototype._msHookedDelete) {
-            targetMap.prototype._msHookedDelete = true;
-            targetMap.prototype.delete = function (k) {
-                try {
-                    if (typeof k === 'string' && k !== 'text-input-chunk-id') {
-                        const existing = this.get(k) || chunkSnapshotCache.get(k);
-                        if (existing && existing.role === 'model') {
-                            const text = typeof existing.text === 'string' ? existing.text : '';
-                            const isThought = !!(existing.thought || existing.Ul || existing.ln);
-                            if (text.length > 0 || isThought) {
-                                const record = {
-                                    id: k,
-                                    chunk: Object.assign({}, existing, { text, thought: isThought }),
-                                    deletedAt: Date.now()
-                                };
-                                if (!this._msDeletedChunks) this._msDeletedChunks = [];
-                                this._msDeletedChunks.push(record);
-                                recentlyDeletedModelChunks.set(k, record);
-                                cleanExpiredSnapshots();
-                            }
-                        }
-                    }
-                } catch (_) {}
-                return origMapDelete.apply(this, arguments);
-            };
-        }
-
-        // 拦截 set: 维护快照、捕获 lJb/AOb 空块替换、捕获 WIb/kOb 覆写清空
+        // 拦截 set: 极速 O(1) 维护快照与原始 Markdown/LaTeX 数据流收集
         if (typeof origMapSet === 'function' && !targetMap.prototype._msHookedSet) {
             targetMap.prototype._msHookedSet = true;
             targetMap.prototype.set = function (k, v) {
-                // 1. 原有的 Angular LView 映射表记录
+                // 1. Angular LView 映射表记录
                 if (typeof k === 'number' && Array.isArray(v) && v.length >= 10 && !seenMaps.has(this) && lViewMapRefs.length < 16) {
                     seenMaps.add(this);
                     if (typeof WeakRef !== 'undefined') {
@@ -198,7 +66,7 @@
                     }
                 }
 
-                // 2. 防撤回核心数据层守卫
+                // 2. 渲染修复所需的数据流监听与极速缓存 (O(1) 性能极速通道)
                 try {
                     if (v && typeof v === 'object' && v.role === 'model' && typeof k === 'string') {
                         const prevSnapshot = chunkSnapshotCache.get(k);
@@ -210,7 +78,6 @@
 
                         const rawText = typeof v.text === 'string' ? v.text : '';
                         const hasSubstantiveText = rawText.length > 0;
-                        const isUserInitiated = isUserInitiatedAction();
                         const isThoughtChunk = !!(v.thought || v.Ul || v.ln);
 
                         // 实时收集 Markdown 表格行与原始完整 LaTeX 环境，消除昂贵的网络层流式克隆与深度反射
@@ -222,7 +89,7 @@
                         }
 
                         if (hasSubstantiveText || isThoughtChunk) {
-                            // 正常流式生长：保持最新最长文本快照
+                            // 保持最新最长文本快照 (供 findRawTableLine 与 findRawLatexEnvBlock 极速内存检索)
                             const oldText = prevSnapshot ? prevSnapshot.text : '';
                             const longest = rawText.length >= oldText.length ? rawText : oldText;
                             chunkSnapshotCache.set(k, {
@@ -231,151 +98,10 @@
                                 thought: isThoughtChunk,
                                 text: longest,
                                 lastRef: v,
-                                Di: v.Di ? [...v.Di] : (v.Ej ? [...v.Ej] : void 0),
-                                Ej: v.Ej ? [...v.Ej] : void 0,
                                 timestamp: v.timestamp || Date.now(),
                                 lastSeen: Date.now()
                             });
-                        }
-
-                        // 核心防线 A: 拦截 AOb/lJb 撤回空块（AI Studio 因 finishReason 黑名单清空当前轮并插入 text: "" 的空块）
-                        const finishMetaObj = getChunkFinishMeta(v);
-                        const finishCode = finishMetaObj && finishMetaObj.meta ? finishMetaObj.meta.finishReason : undefined;
-                        const isRetractReason = finishCode !== undefined && RETRACT_FINISH_REASONS.has(finishCode);
-                        const hasDeleted = (this._msDeletedChunks && this._msDeletedChunks.length > 0) || recentlyDeletedModelChunks.size > 0;
-
-                        // 凡带有完成码 (finishReason)，说明该 chunk 的流式生成已在网络层实质结束
-                        // 强制闭合 ln (加载中) 与 Ul 状态，根治手机端永久停滞在“処理しています”/思考动画与 Stop 状态机死锁
-                        if (finishCode !== undefined) {
-                            if (v.ln) v.ln = false;
-                            if (v.Ul) v.Ul = false;
-                        }
-
-                        if (!isUserInitiated && isRetractReason) {
-                            if (!hasSubstantiveText && hasDeleted) {
-                                const now = Date.now();
-                                const candidateList = (this._msDeletedChunks && this._msDeletedChunks.length > 0)
-                                    ? this._msDeletedChunks
-                                    : Array.from(recentlyDeletedModelChunks.values());
-
-                                const thoughtChunks = [];
-                                const mainChunks = [];
-                                const seenChunkIds = new Set();
-
-                                for (let i = 0; i < candidateList.length; i++) {
-                                    const rec = candidateList[i];
-                                    if (now - rec.deletedAt < 8000) {
-                                        const ch = rec.chunk;
-                                        const cid = rec.id || ch.id;
-                                        if (cid && seenChunkIds.has(cid)) continue;
-                                        if (cid) seenChunkIds.add(cid);
-
-                                        const chText = typeof ch.text === 'string' ? ch.text : '';
-                                        if (ch.thought) {
-                                            if (chText.trim().length > 0) thoughtChunks.push(chText);
-                                        } else if (chText.trim().length > 0) {
-                                            mainChunks.push(chText);
-                                        }
-                                    }
-                                }
-
-                                const combinedThought = thoughtChunks.join('\n\n');
-                                const combinedMain = mainChunks.join('\n\n');
-
-                                if (combinedMain.trim().length > 0 || combinedThought.trim().length > 0) {
-                                    const finishMsg = (finishMetaObj && finishMetaObj.meta && finishMetaObj.meta.finishMessage) ? ` (${finishMetaObj.meta.finishMessage})` : '';
-
-                                    let injected = '';
-                                    if (combinedThought.trim().length > 0) {
-                                        injected += `> 💭 **[已救回的思考过程]**\n>\n> ${combinedThought.replace(/\r?\n/g, '\n> ')}\n\n`;
-                                    }
-                                    if (combinedMain.trim().length > 0) {
-                                        injected += combinedMain;
-                                    } else if (combinedThought.trim().length > 0) {
-                                        injected += `> 💭 *[模型在思考阶段被中断撤回，已完整保留思考内容]*`;
-                                    }
-
-                                    injected += `\n\n> 🛡️ **[防撤回保护生效]** 检测到 AI Studio 触发异常撤回（原因代码: \`${finishCode}\`${finishMsg}），已自动拦截并完整保留生成内容。`;
-
-                                    v.text = injected;
-                                    v._msAntiRetractionRescued = true;
-                                    if (finishMetaObj) {
-                                        v._originalDl = Object.assign({}, finishMetaObj.meta);
-                                        setChunkFinishMeta(v, { finishReason: 1 });
-                                    }
-                                    v.incomplete = false;
-                                    if ('Ub' in v) v.Ub = 1;
-                                    if ('lc' in v) v.lc = 1;
-                                    v.Ul = false;
-                                    v.ln = false;
-
-                                    try {
-                                        console.info(`[AI Studio Fix] 🛡️ (第2层) 成功拦截并复活异常撤回回复 (finishReason: ${finishCode})`);
-                                    } catch (_) {}
-
-                                    this._msDeletedChunks = [];
-                                    recentlyDeletedModelChunks.clear();
-                                }
-                            } else if (!hasSubstantiveText && !hasDeleted) {
-                                // 场景：第 1 层拦截引导走入原生 else 分支但模型因敏感词拒答零生成，或原地覆写空块
-                                if (prevSnapshot && prevSnapshot.text && prevSnapshot.text.length > 20) {
-                                    v.text = prevSnapshot.text;
-                                    if (prevSnapshot.Di && (!v.Di || v.Di.length === 0)) {
-                                        v.Di = [...prevSnapshot.Di];
-                                    }
-                                    if (prevSnapshot.Ej && (!v.Ej || v.Ej.length === 0)) {
-                                        v.Ej = [...prevSnapshot.Ej];
-                                    }
-                                    v._msAntiRetractionPreserved = true;
-                                } else {
-                                    const finishMsg = (finishMetaObj && finishMetaObj.meta && finishMetaObj.meta.finishMessage) ? ` (${finishMetaObj.meta.finishMessage})` : '';
-                                    v.text = `> 🛡️ **[内容被系统安全策略拦截]**\n> 检测到 AI Studio 触发异常拦截或安全拒答（原因代码: \`${finishCode}\`${finishMsg}），未生成回答正文。`;
-                                    v._msAntiRetractionRescued = true;
-                                }
-                                if (finishMetaObj) {
-                                    v._originalDl = Object.assign({}, finishMetaObj.meta);
-                                    setChunkFinishMeta(v, { finishReason: 1 });
-                                }
-                                v.incomplete = false;
-                                if ('Ub' in v) v.Ub = 1;
-                                if ('lc' in v) v.lc = 1;
-                                v.Ul = false;
-                                v.ln = false;
-                                try {
-                                    console.info(`[AI Studio Fix] 🛡️ (第2层) 成功闭合零内容拦截空块并解除加载态 (finishReason: ${finishCode})`);
-                                } catch (_) {}
-                            } else if (hasSubstantiveText) {
-                                // 场景：已有部分生成内容时触发异常中断，保留正文并解除加载态
-                                const finishMsg = (finishMetaObj && finishMetaObj.meta && finishMetaObj.meta.finishMessage) ? ` (${finishMetaObj.meta.finishMessage})` : '';
-                                if (!v.text.includes('[防撤回保护生效]')) {
-                                    v.text += `\n\n> 🛡️ **[防撤回保护生效]** 检测到 AI Studio 触发异常中断（原因代码: \`${finishCode}\`${finishMsg}），已自动保留全部已生成正文。`;
-                                }
-                                v._msAntiRetractionRescued = true;
-                                if (finishMetaObj) {
-                                    v._originalDl = Object.assign({}, finishMetaObj.meta);
-                                    setChunkFinishMeta(v, { finishReason: 1 });
-                                }
-                                v.incomplete = false;
-                                if ('Ub' in v) v.Ub = 1;
-                                if ('lc' in v) v.lc = 1;
-                                v.Ul = false;
-                                v.ln = false;
-                                try {
-                                    console.info(`[AI Studio Fix] 🛡️ (第2层) 成功保护已生成文本并解除加载态 (finishReason: ${finishCode})`);
-                                } catch (_) {}
-                            }
-                        }
-
-                        // 核心防线 B: 拦截 WIb / kOb / hJa 意外原地覆写清空（无用户交互时已有长文本突然被置空）
-                        if (!isUserInitiated && !hasSubstantiveText && prevSnapshot && prevSnapshot.text && prevSnapshot.text.length > 20) {
-                            v.text = prevSnapshot.text;
-                            if (prevSnapshot.Di && (!v.Di || v.Di.length === 0)) {
-                                v.Di = [...prevSnapshot.Di];
-                            }
-                            if (prevSnapshot.Ej && (!v.Ej || v.Ej.length === 0)) {
-                                v.Ej = [...prevSnapshot.Ej];
-                            }
-                            v._msAntiRetractionPreserved = true;
+                            cleanExpiredSnapshots();
                         }
                     }
                 } catch (_) {}
