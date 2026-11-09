@@ -3,10 +3,10 @@
 // @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复 (含防撤回/防截断)
 // @name:ja      Google AI Studio 数式＆Markdownレンダリング修正 (リトラクション防止)
 // @namespace    https://github.com/m1kuk1m/google-aistudio-latex-markdown-fix
-// @version      1.5.0
-// @description  Fixes AI Studio output retraction and truncation, LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, CJK punctuation formatting glitches, and cross-block formula splits in Google AI Studio.
-// @description:zh-CN 修复与防护 Google AI Studio 上的回答意外截断与敏感词整段撤回、Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆、CJK 标点斜体窃取排版及多行 LaTeX 公式被列表/引用语法跨块劈裂问题
-// @description:ja Google AI Studioにおける回答の意図しない切断・取り消し（リトラクション）の防止、数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合、リスト構文による数式分断を修正します
+// @version      1.5.1
+// @description  Fixes AI Studio output retraction and truncation, mobile streaming loading freeze ("処理しています" / thinking hang), LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, CJK punctuation formatting glitches, and cross-block formula splits in Google AI Studio.
+// @description:zh-CN 修复与防护 Google AI Studio 上的回答意外截断与敏感词整段撤回、手机端流式长久卡死在等待回复（処理しています/思考脉冲动画与Stop按钮锁死）、Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆、CJK 标点斜体窃取排版及多行 LaTeX 公式跨块劈裂问题
+// @description:ja Google AI Studioにおける回答の意図しない切断・取り消し（リトラクション）の防止、モバイル環境での「処理しています」永久停止の解消、数式テーブルの途切れ、分割行列の縦线欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合、リスト構文による数式分断を修正します
 // @author       m1kuk1m
 // @match        https://aistudio.google.com/*
 // @require      https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js
@@ -33,25 +33,37 @@
     // AI Studio 官方触发撤回的 finishReason 黑名单 (对应官方源码 wNb/jIb = [0, 3, 4, 5, 7, 8, 9, 11, 14, 15, 17])
     const RETRACT_FINISH_REASONS = new Set([3, 4, 5, 7, 8, 9, 11, 14, 15, 17]);
 
-    // 用户主动操作时间戳（用于区分用户主动点击清空/删除/重试 与 系统的被动抽风撤回）
+    // 用户主动操作时间戳（用于区分用户主动点击清空/删除/重试/发送 与 系统的被动抽风撤回）
     let userActiveActionTs = 0;
     const isUserInitiatedAction = () => (Date.now() - userActiveActionTs) < 1500;
     const markUserAction = (e) => {
         try {
+            // 移动端软键盘/输入法回车或提交快捷键支持
+            if (e && (e.type === 'keydown' || e.type === 'keyup')) {
+                if (e.key === 'Enter' || e.keyCode === 13) {
+                    userActiveActionTs = Date.now();
+                    return;
+                }
+            }
+
             const target = e && e.target;
             if (!target || typeof target.closest !== 'function') return;
-            if (target.closest('button, [role="button"], mat-icon, ms-prompt-run-button, .delete-turn-button, [aria-label*="delete" i], [aria-label*="clear" i], [aria-label*="edit" i], [aria-label*="rerun" i]')) {
+            if (target.closest('button, [role="button"], mat-icon, ms-run-button, ms-prompt-run-button, .run-button, .delete-turn-button, [aria-label*="delete" i], [aria-label*="clear" i], [aria-label*="edit" i], [aria-label*="rerun" i], [aria-label*="run" i], [aria-label*="send" i]')) {
                 userActiveActionTs = Date.now();
             }
         } catch (_) {}
     };
-    if (typeof win.addEventListener === 'function') {
-        win.addEventListener('click', markUserAction, true);
-        win.addEventListener('pointerdown', markUserAction, true);
-    }
-    if (typeof window !== 'undefined' && window !== win && typeof window.addEventListener === 'function') {
-        window.addEventListener('click', markUserAction, true);
-        window.addEventListener('pointerdown', markUserAction, true);
+
+    const attachActionListeners = (targetWin) => {
+        if (!targetWin || typeof targetWin.addEventListener !== 'function') return;
+        targetWin.addEventListener('click', markUserAction, true);
+        targetWin.addEventListener('pointerdown', markUserAction, true);
+        targetWin.addEventListener('touchstart', markUserAction, { capture: true, passive: true });
+        targetWin.addEventListener('keydown', markUserAction, true);
+    };
+    attachActionListeners(win);
+    if (typeof window !== 'undefined' && window !== win) {
+        attachActionListeners(window);
     }
 
     // ---------------- 第 1 层：Array.prototype.includes 源头签名守卫 ----------------
@@ -232,52 +244,112 @@
                         const isRetractReason = finishCode !== undefined && RETRACT_FINISH_REASONS.has(finishCode);
                         const hasDeleted = (this._msDeletedChunks && this._msDeletedChunks.length > 0) || recentlyDeletedModelChunks.size > 0;
 
-                        if (!isUserInitiated && !hasSubstantiveText && isRetractReason && hasDeleted) {
-                            const now = Date.now();
-                            const candidateList = (this._msDeletedChunks && this._msDeletedChunks.length > 0)
-                                ? this._msDeletedChunks
-                                : Array.from(recentlyDeletedModelChunks.values());
+                        // 凡带有完成码 (finishReason)，说明该 chunk 的流式生成已在网络层实质结束
+                        // 强制闭合 ln (加载中) 与 Ul 状态，根治手机端永久停滞在“処理しています”/思考动画与 Stop 状态机死锁
+                        if (finishCode !== undefined) {
+                            if (v.ln) v.ln = false;
+                            if (v.Ul) v.Ul = false;
+                        }
 
-                            const thoughtChunks = [];
-                            const mainChunks = [];
-                            const seenChunkIds = new Set();
+                        if (!isUserInitiated && isRetractReason) {
+                            if (!hasSubstantiveText && hasDeleted) {
+                                const now = Date.now();
+                                const candidateList = (this._msDeletedChunks && this._msDeletedChunks.length > 0)
+                                    ? this._msDeletedChunks
+                                    : Array.from(recentlyDeletedModelChunks.values());
 
-                            for (let i = 0; i < candidateList.length; i++) {
-                                const rec = candidateList[i];
-                                if (now - rec.deletedAt < 8000) {
-                                    const ch = rec.chunk;
-                                    const cid = rec.id || ch.id;
-                                    if (cid && seenChunkIds.has(cid)) continue;
-                                    if (cid) seenChunkIds.add(cid);
+                                const thoughtChunks = [];
+                                const mainChunks = [];
+                                const seenChunkIds = new Set();
 
-                                    const chText = typeof ch.text === 'string' ? ch.text : '';
-                                    if (ch.thought) {
-                                        if (chText.trim().length > 0) thoughtChunks.push(chText);
-                                    } else if (chText.trim().length > 0) {
-                                        mainChunks.push(chText);
+                                for (let i = 0; i < candidateList.length; i++) {
+                                    const rec = candidateList[i];
+                                    if (now - rec.deletedAt < 8000) {
+                                        const ch = rec.chunk;
+                                        const cid = rec.id || ch.id;
+                                        if (cid && seenChunkIds.has(cid)) continue;
+                                        if (cid) seenChunkIds.add(cid);
+
+                                        const chText = typeof ch.text === 'string' ? ch.text : '';
+                                        if (ch.thought) {
+                                            if (chText.trim().length > 0) thoughtChunks.push(chText);
+                                        } else if (chText.trim().length > 0) {
+                                            mainChunks.push(chText);
+                                        }
                                     }
                                 }
-                            }
 
-                            const combinedThought = thoughtChunks.join('\n\n');
-                            const combinedMain = mainChunks.join('\n\n');
+                                const combinedThought = thoughtChunks.join('\n\n');
+                                const combinedMain = mainChunks.join('\n\n');
 
-                            if (combinedMain.trim().length > 0 || combinedThought.trim().length > 0) {
+                                if (combinedMain.trim().length > 0 || combinedThought.trim().length > 0) {
+                                    const finishMsg = (finishMetaObj && finishMetaObj.meta && finishMetaObj.meta.finishMessage) ? ` (${finishMetaObj.meta.finishMessage})` : '';
+
+                                    let injected = '';
+                                    if (combinedThought.trim().length > 0) {
+                                        injected += `> 💭 **[已救回的思考过程]**\n>\n> ${combinedThought.replace(/\r?\n/g, '\n> ')}\n\n`;
+                                    }
+                                    if (combinedMain.trim().length > 0) {
+                                        injected += combinedMain;
+                                    } else if (combinedThought.trim().length > 0) {
+                                        injected += `> 💭 *[模型在思考阶段被中断撤回，已完整保留思考内容]*`;
+                                    }
+
+                                    injected += `\n\n> 🛡️ **[防撤回保护生效]** 检测到 AI Studio 触发异常撤回（原因代码: \`${finishCode}\`${finishMsg}），已自动拦截并完整保留生成内容。`;
+
+                                    v.text = injected;
+                                    v._msAntiRetractionRescued = true;
+                                    if (finishMetaObj) {
+                                        v._originalDl = Object.assign({}, finishMetaObj.meta);
+                                        setChunkFinishMeta(v, { finishReason: 1 });
+                                    }
+                                    v.incomplete = false;
+                                    if ('Ub' in v) v.Ub = 1;
+                                    if ('lc' in v) v.lc = 1;
+                                    v.Ul = false;
+                                    v.ln = false;
+
+                                    try {
+                                        console.info(`[AI Studio Fix] 🛡️ (第2层) 成功拦截并复活异常撤回回复 (finishReason: ${finishCode})`);
+                                    } catch (_) {}
+
+                                    this._msDeletedChunks = [];
+                                    recentlyDeletedModelChunks.clear();
+                                }
+                            } else if (!hasSubstantiveText && !hasDeleted) {
+                                // 场景：第 1 层拦截引导走入原生 else 分支但模型因敏感词拒答零生成，或原地覆写空块
+                                if (prevSnapshot && prevSnapshot.text && prevSnapshot.text.length > 20) {
+                                    v.text = prevSnapshot.text;
+                                    if (prevSnapshot.Di && (!v.Di || v.Di.length === 0)) {
+                                        v.Di = [...prevSnapshot.Di];
+                                    }
+                                    if (prevSnapshot.Ej && (!v.Ej || v.Ej.length === 0)) {
+                                        v.Ej = [...prevSnapshot.Ej];
+                                    }
+                                    v._msAntiRetractionPreserved = true;
+                                } else {
+                                    const finishMsg = (finishMetaObj && finishMetaObj.meta && finishMetaObj.meta.finishMessage) ? ` (${finishMetaObj.meta.finishMessage})` : '';
+                                    v.text = `> 🛡️ **[内容被系统安全策略拦截]**\n> 检测到 AI Studio 触发异常拦截或安全拒答（原因代码: \`${finishCode}\`${finishMsg}），未生成回答正文。`;
+                                    v._msAntiRetractionRescued = true;
+                                }
+                                if (finishMetaObj) {
+                                    v._originalDl = Object.assign({}, finishMetaObj.meta);
+                                    setChunkFinishMeta(v, { finishReason: 1 });
+                                }
+                                v.incomplete = false;
+                                if ('Ub' in v) v.Ub = 1;
+                                if ('lc' in v) v.lc = 1;
+                                v.Ul = false;
+                                v.ln = false;
+                                try {
+                                    console.info(`[AI Studio Fix] 🛡️ (第2层) 成功闭合零内容拦截空块并解除加载态 (finishReason: ${finishCode})`);
+                                } catch (_) {}
+                            } else if (hasSubstantiveText) {
+                                // 场景：已有部分生成内容时触发异常中断，保留正文并解除加载态
                                 const finishMsg = (finishMetaObj && finishMetaObj.meta && finishMetaObj.meta.finishMessage) ? ` (${finishMetaObj.meta.finishMessage})` : '';
-
-                                let injected = '';
-                                if (combinedThought.trim().length > 0) {
-                                    injected += `> 💭 **[已救回的思考过程]**\n>\n> ${combinedThought.replace(/\r?\n/g, '\n> ')}\n\n`;
+                                if (!v.text.includes('[防撤回保护生效]')) {
+                                    v.text += `\n\n> 🛡️ **[防撤回保护生效]** 检测到 AI Studio 触发异常中断（原因代码: \`${finishCode}\`${finishMsg}），已自动保留全部已生成正文。`;
                                 }
-                                if (combinedMain.trim().length > 0) {
-                                    injected += combinedMain;
-                                } else if (combinedThought.trim().length > 0) {
-                                    injected += `> 💭 *[模型在思考阶段被中断撤回，已完整保留思考内容]*`;
-                                }
-
-                                injected += `\n\n> 🛡️ **[防撤回保护生效]** 检测到 AI Studio 触发异常撤回（原因代码: \`${finishCode}\`${finishMsg}），已自动拦截并完整保留生成内容。`;
-
-                                v.text = injected;
                                 v._msAntiRetractionRescued = true;
                                 if (finishMetaObj) {
                                     v._originalDl = Object.assign({}, finishMetaObj.meta);
@@ -286,15 +358,11 @@
                                 v.incomplete = false;
                                 if ('Ub' in v) v.Ub = 1;
                                 if ('lc' in v) v.lc = 1;
-                                if ('Ul' in v) v.Ul = false;
-                                if ('ln' in v) v.ln = false;
-
+                                v.Ul = false;
+                                v.ln = false;
                                 try {
-                                    console.info(`[AI Studio Fix] 🛡️ (第2层) 成功拦截并复活异常撤回回复 (finishReason: ${finishCode})`);
+                                    console.info(`[AI Studio Fix] 🛡️ (第2层) 成功保护已生成文本并解除加载态 (finishReason: ${finishCode})`);
                                 } catch (_) {}
-
-                                this._msDeletedChunks = [];
-                                recentlyDeletedModelChunks.clear();
                             }
                         }
 
@@ -563,23 +631,25 @@
                     const asc = document.querySelector('ms-autoscroll-container');
                     const isHorizontallyScrolled = asc && asc.scrollLeft > 2;
 
-                    const filtered = entries.filter((entry) => {
-                        if (entry.isIntersecting) return true;
+                    const safeEntries = entries.map((entry) => {
+                        if (entry.isIntersecting) return entry;
                         const rect = entry.boundingClientRect;
-                        if (!rect || rect.height === 0) return true;
+                        if (!rect || rect.height === 0) return entry;
                         const rootTop = entry.rootBounds ? entry.rootBounds.top : 0;
                         const rootBottom = entry.rootBounds ? entry.rootBounds.bottom : (targetWin.innerHeight || 1000);
                         const verticallyVisible = rect.bottom > rootTop - 300 && rect.top < rootBottom + 300;
-                        // 若元素在纵向仍处于屏幕可视范围（仅因横向拉动导致 X 轴滑出屏幕），绝不通知 Angular 卸载
+                        // 若元素在纵向仍处于屏幕可视范围（仅因横向拉动导致 X 轴滑出屏幕），维持其相交状态，绝不通知 Angular 虚拟滚动卸载
                         if (verticallyVisible && (isHorizontallyScrolled || rect.right <= 50)) {
-                            return false;
+                            try {
+                                return Object.assign(Object.create(Object.getPrototypeOf(entry)), entry, { isIntersecting: true });
+                            } catch (_) {
+                                return entry;
+                            }
                         }
-                        return true;
+                        return entry;
                     });
 
-                    if (filtered.length > 0) {
-                        return callback.call(this, filtered, observer);
-                    }
+                    return callback.call(this, safeEntries, observer);
                 };
 
                 let newOpts = options;

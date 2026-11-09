@@ -464,8 +464,8 @@ const scriptSource = fs.readFileSync(scriptPath, 'utf8');
 console.log('--- Test Suite 1: Script Header & Metadata Check ---');
 const versionMatch = scriptSource.match(/@version\s+([0-9.]+)/);
 assert.ok(versionMatch, 'Version header should exist');
-assert.strictEqual(versionMatch[1], '1.5.0', 'Version should be bumped to 1.5.0');
-console.log('✔ Version is correctly 1.5.0');
+assert.strictEqual(versionMatch[1], '1.5.1', 'Version should be bumped to 1.5.1');
+console.log('✔ Version is correctly 1.5.1');
 
 assert.ok(scriptSource.includes('fixBrokenCodeBlocks'), 'Script must define fixBrokenCodeBlocks');
 assert.ok(scriptSource.includes('fixBrokenTildeMarkdown'), 'Script must define fixBrokenTildeMarkdown');
@@ -478,7 +478,7 @@ console.log('✔ Functions correctly named and old function removed\n');
 // Wrap script in an evaluator that exposes private functions for testing
 const wrappedSource = scriptSource.replace(
     'function runAllFixes() {',
-    'global.__scriptInternals = { fixBrokenCodeBlocks, fixBrokenTildeMarkdown, fixBrokenBiochemicalStarBold, fixBrokenCjkPunctuationBold, fixBrokenParagraphs, fixBrokenBoldMarkdown, findRawLatexEnvBlock, collectRawLatexEnvsFromString, rawLatexEnvBlocks, resetUserAction: () => { userActiveActionTs = 0; }, runAllFixes };\nfunction runAllFixes() {'
+    'global.__scriptInternals = { fixBrokenCodeBlocks, fixBrokenTildeMarkdown, fixBrokenBiochemicalStarBold, fixBrokenCjkPunctuationBold, fixBrokenParagraphs, fixBrokenBoldMarkdown, findRawLatexEnvBlock, collectRawLatexEnvsFromString, rawLatexEnvBlocks, isUserInitiatedAction, markUserAction, resetUserAction: () => { userActiveActionTs = 0; }, runAllFixes };\nfunction runAllFixes() {'
 );
 
 try {
@@ -499,6 +499,8 @@ const {
     findRawLatexEnvBlock,
     collectRawLatexEnvsFromString,
     rawLatexEnvBlocks,
+    isUserInitiatedAction,
+    markUserAction,
     resetUserAction,
     runAllFixes
 } = global.__scriptInternals;
@@ -2562,6 +2564,150 @@ $$\\begin{array}{rccccccc}
     assert.strictEqual(ul.getAttribute('data-ms-math-hidden'), null, 'data-ms-math-hidden removed after restore');
 
     console.log('✔ Case 10.5 Passed: In-place DOM reversibility and hidden node cleanup verified');
+}
+
+// ----------------------------------------------------
+console.log('\n--- Test Suite 11: Mobile Stuck Loading & Safety Retraction Closure Tests (v1.5.1) ---');
+
+// 11.1 Zero-Content Safety Block Interception (Screenshot exact case: safety refusal with text: "")
+{
+    resetUserAction();
+    const entities = new Map();
+    const chunkId = 'model-chunk-safety-zero-content-' + Date.now();
+    const interceptedChunk = {
+        id: chunkId,
+        role: 'model',
+        yb: 'text',
+        ln: true,
+        text: '',
+        tokenCount: 0,
+        lc: 1,
+        Mm: {
+            finishReason: 3, // SAFETY
+            finishMessage: 'SAFETY_VIOLATION'
+        }
+    };
+
+    // Simulate AI Studio setting chunk into entities map
+    entities.set(chunkId, interceptedChunk);
+
+    // Verifications:
+    // 1) ln must be strictly closed to false (terminating the "処理しています" loading spinner)
+    assert.strictEqual(interceptedChunk.ln, false, 'Loading flag ln must be closed to false');
+    assert.strictEqual(interceptedChunk.Ul, false, 'Streaming flag Ul must be closed to false');
+
+    // 2) text must be populated with a helpful safety notification rather than left empty
+    assert.ok(interceptedChunk.text.includes('[内容被系统安全策略拦截]'), 'Safety notice must be injected');
+    assert.ok(interceptedChunk.text.includes('3'), 'Finish reason code must be shown');
+
+    // 3) finishReason must be normalized to STOP (1) and incomplete set to false so Angular stops spinning
+    assert.strictEqual(interceptedChunk.incomplete, false, 'incomplete flag must be false');
+    assert.strictEqual(interceptedChunk.Mm.finishReason, 1, 'finishReason must be normalized to 1');
+
+    console.log('✔ Case 11.1 Passed: Zero-content safety interception closed loading state and injected helpful notice');
+}
+
+// 11.2 Prohibited Content Interception with No Deleted Chunks (Layer 1 else branch routing)
+{
+    resetUserAction();
+    const entities = new Map();
+    const chunkId = 'model-chunk-prohibited-zero-content-' + Date.now();
+    const interceptedChunk = {
+        id: chunkId,
+        role: 'model',
+        yb: 'text',
+        ln: true,
+        text: '',
+        Dl: {
+            finishReason: 8, // PROHIBITED_CONTENT
+            finishMessage: 'PROHIBITED'
+        }
+    };
+
+    entities.set(chunkId, interceptedChunk);
+
+    assert.strictEqual(interceptedChunk.ln, false, 'Loading flag ln must be closed to false');
+    assert.ok(interceptedChunk.text.includes('[内容被系统安全策略拦截]'), 'Notice must be injected');
+    assert.ok(interceptedChunk.text.includes('8'), 'Prohibited code 8 must be shown');
+    assert.strictEqual(interceptedChunk.Dl.finishReason, 1, 'finishReason must be normalized');
+
+    console.log('✔ Case 11.2 Passed: Prohibited content zero-content interception gracefully handled');
+}
+
+// 11.3 Partial Text Generation Followed by Abnormal Interruption
+{
+    resetUserAction();
+    const entities = new Map();
+    const chunkId = 'model-chunk-partial-text-' + Date.now();
+    const partialChunk = {
+        id: chunkId,
+        role: 'model',
+        yb: 'text',
+        ln: true,
+        text: '关于该历史人物的考证，经查证史料记载如下：',
+        Mm: {
+            finishReason: 3, // SAFETY interruption during streaming
+            finishMessage: 'SAFETY'
+        }
+    };
+
+    entities.set(chunkId, partialChunk);
+
+    // 1) ln must be false
+    assert.strictEqual(partialChunk.ln, false, 'Loading flag ln must be closed to false');
+    // 2) Original partial text must be preserved
+    assert.ok(partialChunk.text.startsWith('关于该历史人物的考证'), 'Original partial text must be kept');
+    // 3) Protective notice appended
+    assert.ok(partialChunk.text.includes('[防撤回保护生效]'), 'Retraction protection notice must be appended');
+    assert.strictEqual(partialChunk.Mm.finishReason, 1, 'finishReason normalized to 1');
+
+    console.log('✔ Case 11.3 Passed: Partial generated text preserved and loading state released on safety interruption');
+}
+
+// 11.4 Mobile Keyboard & Touch User Action Detection
+{
+    resetUserAction();
+    assert.strictEqual(isUserInitiatedAction(), false, 'Should be inactive initially');
+
+    // 1) Mobile virtual keyboard Enter keydown
+    markUserAction({ type: 'keydown', key: 'Enter', keyCode: 13 });
+    assert.strictEqual(isUserInitiatedAction(), true, 'Virtual keyboard Enter must be recognized as user-initiated action');
+
+    // 2) Reset and test touchstart on <ms-run-button>
+    resetUserAction();
+    assert.strictEqual(isUserInitiatedAction(), false, 'Reset successfully');
+
+    const fakeRunBtn = {
+        closest: (selector) => selector.includes('ms-run-button') ? true : null
+    };
+    markUserAction({ type: 'touchstart', target: fakeRunBtn });
+    assert.strictEqual(isUserInitiatedAction(), true, 'Touchstart on ms-run-button must be recognized as user-initiated action');
+
+    console.log('✔ Case 11.4 Passed: Mobile virtual keyboard Enter and touch actions reliably recognized');
+}
+
+// 11.5 Normal Generation Stream Completion releases ln
+{
+    resetUserAction();
+    const entities = new Map();
+    const chunkId = 'model-chunk-normal-completion-' + Date.now();
+    const normalChunk = {
+        id: chunkId,
+        role: 'model',
+        yb: 'text',
+        ln: true,
+        text: '这是正常的回答内容。',
+        Mm: {
+            finishReason: 1 // STOP
+        }
+    };
+
+    entities.set(chunkId, normalChunk);
+
+    assert.strictEqual(normalChunk.ln, false, 'Normal stream completion with finishReason: 1 must release ln to false');
+    assert.strictEqual(normalChunk.text, '这是正常的回答内容。', 'Normal text preserved intact');
+
+    console.log('✔ Case 11.5 Passed: Normal stream completion releases loading flag cleanly');
 }
 
 console.log('\n=========================================');
