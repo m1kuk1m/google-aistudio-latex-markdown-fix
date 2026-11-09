@@ -464,8 +464,8 @@ const scriptSource = fs.readFileSync(scriptPath, 'utf8');
 console.log('--- Test Suite 1: Script Header & Metadata Check ---');
 const versionMatch = scriptSource.match(/@version\s+([0-9.]+)/);
 assert.ok(versionMatch, 'Version header should exist');
-assert.strictEqual(versionMatch[1], '1.4.2', 'Version should be bumped to 1.4.2');
-console.log('✔ Version is correctly 1.4.2');
+assert.strictEqual(versionMatch[1], '1.5.0', 'Version should be bumped to 1.5.0');
+console.log('✔ Version is correctly 1.5.0');
 
 assert.ok(scriptSource.includes('fixBrokenCodeBlocks'), 'Script must define fixBrokenCodeBlocks');
 assert.ok(scriptSource.includes('fixBrokenTildeMarkdown'), 'Script must define fixBrokenTildeMarkdown');
@@ -478,7 +478,7 @@ console.log('✔ Functions correctly named and old function removed\n');
 // Wrap script in an evaluator that exposes private functions for testing
 const wrappedSource = scriptSource.replace(
     'function runAllFixes() {',
-    'global.__scriptInternals = { fixBrokenCodeBlocks, fixBrokenTildeMarkdown, fixBrokenBiochemicalStarBold, fixBrokenCjkPunctuationBold, fixBrokenParagraphs, fixBrokenBoldMarkdown, resetUserAction: () => { userActiveActionTs = 0; }, runAllFixes };\nfunction runAllFixes() {'
+    'global.__scriptInternals = { fixBrokenCodeBlocks, fixBrokenTildeMarkdown, fixBrokenBiochemicalStarBold, fixBrokenCjkPunctuationBold, fixBrokenParagraphs, fixBrokenBoldMarkdown, findRawLatexEnvBlock, collectRawLatexEnvsFromString, rawLatexEnvBlocks, resetUserAction: () => { userActiveActionTs = 0; }, runAllFixes };\nfunction runAllFixes() {'
 );
 
 try {
@@ -496,6 +496,9 @@ const {
     fixBrokenCjkPunctuationBold,
     fixBrokenParagraphs,
     fixBrokenBoldMarkdown,
+    findRawLatexEnvBlock,
+    collectRawLatexEnvsFromString,
+    rawLatexEnvBlocks,
     resetUserAction,
     runAllFixes
 } = global.__scriptInternals;
@@ -2388,6 +2391,177 @@ console.log('\n--- Test Suite 9: Anti-Retraction & Truncation Engine Tests ---')
     assert.strictEqual(pre.style.display, '', 'pre display style must be restored');
 
     console.log('✔ Case 2.8 Passed: Pseudo codeblock correctly reverted when real code keywords stream in');
+}
+
+// ----------------------------------------------------
+console.log('\n--- Test Suite 10: Cross-Block Formula Stitching Tests (v1.5.0) ---');
+
+// 10.1 Screenshot Exact Reproduction: Domino Cancellation Array split by '+ ' into <p> + <ul><li>
+{
+    mockDoc.body.childNodes = [];
+    const turn = mockDoc.createElement('div');
+    turn.className = 'markdown-content';
+
+    const rawMarkdownSource = `现在，把这两部分**上下对齐加起来**：
+
+$$\\begin{array}{rccccccc}
+& 1 & + & x & + & x^2 & & \\\\
++ & & - & x & - & x^2 & - & x^3 \\\\
+\\hline
+= & 1 & + & 0 & + & 0 & - & x^3
+\\end{array}$$`;
+
+    // 1. Simulate network stream feeding raw markdown to cache
+    collectRawLatexEnvsFromString(rawMarkdownSource);
+
+    // 2. Simulate AI Studio CommonMark DOM structure (p + ul)
+    const p = mockDoc.createElement('p');
+    p.appendChild(mockDoc.createTextNode('现在，把这两部分**上下对齐加起来**：\n\n\\begin{array}{rccccccc}\n& 1 & + & x & + & x^2 & & \\\n'));
+
+    const ul = mockDoc.createElement('ul');
+    const li = mockDoc.createElement('li');
+    // Note: '+' was swallowed by CommonMark as list bullet, and '\\' became single '\'
+    li.appendChild(mockDoc.createTextNode('& & - & x & - & x^2 & - & x^3 \\\n\\hline\n= & 1 & + & 0 & + & 0 & - & x^3\n\\end{array}'));
+    ul.appendChild(li);
+
+    turn.appendChild(p);
+    turn.appendChild(ul);
+    mockDoc.body.appendChild(turn);
+
+    // Execute full pipeline
+    runAllFixes();
+
+    // Verification 1: KaTeX formula rendered inside <p>
+    const katexEl = p.querySelector('.katex');
+    assert.ok(katexEl, 'KaTeX rendered formula must exist inside <p>');
+    assert.ok(katexEl.textContent.includes('\\begin{array}'), 'Rendered formula must contain array environment');
+    assert.ok(katexEl.textContent.includes('+ & & - & x'), 'Original swallowed "+" must be seamlessly restored');
+
+    // Verification 2: Subsequent sibling <ul> must be hidden in-place, NOT removed (Angular LView protected)
+    assert.strictEqual(ul.style.display, 'none', 'Subsequent split <ul> must be hidden in place');
+    assert.strictEqual(ul.getAttribute('data-ms-math-hidden'), '1', 'Subsequent split <ul> must be marked data-ms-math-hidden');
+    assert.strictEqual(ul.parentNode, turn, 'Split <ul> must remain connected to parent in DOM tree');
+
+    // Verification 3: Chinese explanation text and bold markdown preserved and bolded
+    const strong = p.querySelector('strong');
+    assert.ok(strong, 'Bold markdown **上下对齐加起来** must be successfully bolded');
+    assert.strictEqual(strong.textContent, '上下对齐加起来');
+
+    console.log('✔ Case 10.1 Passed: Domino cancellation array formula split by "+" seamlessly stitched & restored');
+}
+
+// 10.2 Offline Pure DOM Fallback Mode (zero network cache)
+{
+    mockDoc.body.childNodes = [];
+    rawLatexEnvBlocks.clear(); // Clear all caches to simulate offline mode
+    const turn = mockDoc.createElement('div');
+    turn.className = 'markdown-content';
+
+    const p = mockDoc.createElement('p');
+    p.appendChild(mockDoc.createTextNode('推导过程如下：\n\\begin{array}{rccccccc}\n& 1 & + & x & + & x^2 & & \\\n'));
+
+    const ul = mockDoc.createElement('ul');
+    const li = mockDoc.createElement('li');
+    li.appendChild(mockDoc.createTextNode('& & - & x & - & x^2 & - & x^3 \\\n\\hline\n= & 1 & + & 0 & + & 0 & - & x^3\n\\end{array}'));
+    ul.appendChild(li);
+
+    turn.appendChild(p);
+    turn.appendChild(ul);
+    mockDoc.body.appendChild(turn);
+
+    runAllFixes();
+
+    const katexEl = p.querySelector('.katex');
+    assert.ok(katexEl, 'Formula must be rendered via offline DOM fallback');
+    assert.ok(katexEl.textContent.includes('\\begin{array}'), 'Array environment preserved');
+    assert.ok(katexEl.textContent.includes('+ & & - & x'), 'Offline compensation restored missing "+" prefix');
+    assert.strictEqual(ul.style.display, 'none', 'Split <ul> hidden in place');
+
+    console.log('✔ Case 10.2 Passed: Offline DOM fallback accurately compensated missing list prefix');
+}
+
+// 10.3 Multi-Block Continuous Split (<p> + <ul> + <ul>)
+{
+    mockDoc.body.childNodes = [];
+    const turn = mockDoc.createElement('div');
+    turn.className = 'markdown-content';
+
+    const p = mockDoc.createElement('p');
+    p.appendChild(mockDoc.createTextNode('\\begin{aligned}\na &= 1 + x \\\\\n'));
+
+    const ul1 = mockDoc.createElement('ul');
+    const li1 = mockDoc.createElement('li');
+    li1.appendChild(mockDoc.createTextNode('b &= 2 + y \\\\\n'));
+    ul1.appendChild(li1);
+
+    const ul2 = mockDoc.createElement('ul');
+    const li2 = mockDoc.createElement('li');
+    li2.appendChild(mockDoc.createTextNode('c &= 3 + z\n\\end{aligned}'));
+    ul2.appendChild(li2);
+
+    turn.appendChild(p);
+    turn.appendChild(ul1);
+    turn.appendChild(ul2);
+    mockDoc.body.appendChild(turn);
+
+    runAllFixes();
+
+    const katexEl = p.querySelector('.katex');
+    assert.ok(katexEl, 'Multi-split formula stitched into <p>');
+    assert.strictEqual(ul1.style.display, 'none', 'ul1 hidden');
+    assert.strictEqual(ul2.style.display, 'none', 'ul2 hidden');
+
+    console.log('✔ Case 10.3 Passed: Multi-block continuous split across multiple siblings stitched');
+}
+
+// 10.4 Streaming Half-Baked Formula Guard (Unclosed Stream Protection)
+{
+    mockDoc.body.childNodes = [];
+    const turn = mockDoc.createElement('div');
+    turn.className = 'markdown-content';
+
+    const p = mockDoc.createElement('p');
+    p.appendChild(mockDoc.createTextNode('正在推导：\n\\begin{array}{cc}\n1 & 2 \\\n'));
+    turn.appendChild(p);
+    mockDoc.body.appendChild(turn);
+
+    runAllFixes();
+
+    // Since \end{array} hasn't arrived yet, must NOT create broken math
+    assert.strictEqual(p.querySelector('.katex'), null, 'Unclosed streaming formula must wait for completion');
+    assert.ok(p.textContent.includes('\\begin{array}{cc}'), 'Original text preserved while streaming');
+
+    console.log('✔ Case 10.4 Passed: Streaming unclosed formulas strictly guarded against premature execution');
+}
+
+// 10.5 In-Place DOM Reversibility & Cleanup
+{
+    mockDoc.body.childNodes = [];
+    const turn = mockDoc.createElement('div');
+    turn.className = 'markdown-content';
+
+    const p = mockDoc.createElement('p');
+    p.appendChild(mockDoc.createTextNode('\\begin{array}{c}\n1 \\\\\n'));
+    const ul = mockDoc.createElement('ul');
+    const li = mockDoc.createElement('li');
+    li.appendChild(mockDoc.createTextNode('2\n\\end{array}'));
+    ul.appendChild(li);
+
+    turn.appendChild(p);
+    turn.appendChild(ul);
+    mockDoc.body.appendChild(turn);
+
+    runAllFixes();
+    assert.strictEqual(ul.style.display, 'none', 'Hidden after fix');
+
+    // Simulate container content change triggering restore
+    if (p._msMathState) {
+        p.childNodes[0].textContent = 'Modified content';
+        runAllFixes();
+    }
+    assert.strictEqual(ul.getAttribute('data-ms-math-hidden'), null, 'data-ms-math-hidden removed after restore');
+
+    console.log('✔ Case 10.5 Passed: In-place DOM reversibility and hidden node cleanup verified');
 }
 
 console.log('\n=========================================');

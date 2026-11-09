@@ -3,10 +3,10 @@
 // @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复 (含防撤回/防截断)
 // @name:ja      Google AI Studio 数式＆Markdownレンダリング修正 (リトラクション防止)
 // @namespace    https://github.com/m1kuk1m/google-aistudio-latex-markdown-fix
-// @version      1.4.2
-// @description  Fixes AI Studio output retraction and truncation, LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, and CJK punctuation formatting glitches in Google AI Studio.
-// @description:zh-CN 修复与防护 Google AI Studio 上的回答意外截断与敏感词整段撤回、Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆及 CJK 标点斜体窃取排版问题
-// @description:ja Google AI Studioにおける回答の意図しない切断・取り消し（リトラクション）の防止、数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合を修正します
+// @version      1.5.0
+// @description  Fixes AI Studio output retraction and truncation, LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, CJK punctuation formatting glitches, and cross-block formula splits in Google AI Studio.
+// @description:zh-CN 修复与防护 Google AI Studio 上的回答意外截断与敏感词整段撤回、Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆、CJK 标点斜体窃取排版及多行 LaTeX 公式被列表/引用语法跨块劈裂问题
+// @description:ja Google AI Studioにおける回答の意図しない切断・取り消し（リトラクション）の防止、数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合、リスト構文による数式分断を修正します
 // @author       m1kuk1m
 // @match        https://aistudio.google.com/*
 // @require      https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js
@@ -201,9 +201,12 @@
                         const isUserInitiated = isUserInitiatedAction();
                         const isThoughtChunk = !!(v.thought || v.Ul || v.ln);
 
-                        // 实时收集 Markdown 表格行，消除昂贵的网络层流式克隆与深度反射
+                        // 实时收集 Markdown 表格行与原始完整 LaTeX 环境，消除昂贵的网络层流式克隆与深度反射
                         if (rawText.includes('|')) {
                             collectRawLinesFromString(rawText);
+                        }
+                        if (rawText.includes('begin{')) {
+                            collectRawLatexEnvsFromString(rawText);
                         }
 
                         if (hasSubstantiveText || isThoughtChunk) {
@@ -372,15 +375,105 @@
         }
     }
 
+    // 原始完整 LaTeX 环境缓存池 (上限 800 条)，用于跨块劈裂公式精准无损还原
+    const rawLatexEnvBlocks = new Set();
+
+    const cleanLatexSnippet = (s) => (s || '').replace(/[\s\\]/g, '');
+
+    // 智能收集完整闭合的原始 LaTeX 环境代码块
+    function collectRawLatexEnvsFromString(str) {
+        if (typeof str !== 'string' || !str.includes('begin{') || !str.includes('end{')) return;
+        const envTokenRe = /\\(begin|end)\{([a-zA-Z*]+)\}/g;
+        const stack = [];
+        let m;
+        while ((m = envTokenRe.exec(str)) !== null) {
+            const kind = m[1];
+            const name = m[2];
+            if (kind === 'begin') {
+                stack.push({ name, start: m.index });
+            } else if (kind === 'end') {
+                if (stack.length > 0 && stack[stack.length - 1].name === name) {
+                    const open = stack.pop();
+                    if (stack.length === 0) {
+                        const blockEnd = m.index + m[0].length;
+                        const blockStart = open.start;
+                        // 向外扩展可能包裹的 $$
+                        let fullStart = blockStart;
+                        let fullEnd = blockEnd;
+                        const before = str.slice(Math.max(0, blockStart - 10), blockStart);
+                        const ddBefore = before.lastIndexOf('$$');
+                        if (ddBefore !== -1 && before.slice(ddBefore + 2).trim() === '') {
+                            fullStart = Math.max(0, blockStart - 10) + ddBefore;
+                        }
+                        const after = str.slice(blockEnd, Math.min(str.length, blockEnd + 10));
+                        const ddAfter = after.indexOf('$$');
+                        if (ddAfter !== -1 && after.slice(0, ddAfter).trim() === '') {
+                            fullEnd = blockEnd + ddAfter + 2;
+                        }
+                        const rawBlock = str.slice(fullStart, fullEnd).trim();
+                        if (rawBlock.length > 0) {
+                            rawLatexEnvBlocks.delete(rawBlock);
+                            rawLatexEnvBlocks.add(rawBlock);
+                            if (rawLatexEnvBlocks.size > 800) {
+                                const oldest = rawLatexEnvBlocks.values().next().value;
+                                rawLatexEnvBlocks.delete(oldest);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 从原始 LaTeX 缓存池与快照中检索精准匹配的原始多行公式块
+    function findRawLatexEnvBlock(envName, headSnippet, tailSnippet) {
+        const normHead = headSnippet ? cleanLatexSnippet(headSnippet) : '';
+        const normTail = tailSnippet ? cleanLatexSnippet(tailSnippet) : '';
+
+        function checkMatch(blk) {
+            if (!blk.includes(`\\begin{${envName}}`) || !blk.includes(`\\end{${envName}}`)) return false;
+            const normBlk = cleanLatexSnippet(blk);
+            if (normHead && !normBlk.includes(normHead)) return false;
+            if (normTail && !normBlk.includes(normTail)) return false;
+            return true;
+        }
+
+        // 1) 倒序检索 rawLatexEnvBlocks (最新优先)
+        const blocks = Array.from(rawLatexEnvBlocks);
+        for (let i = blocks.length - 1; i >= 0; i--) {
+            if (checkMatch(blocks[i])) {
+                return blocks[i];
+            }
+        }
+
+        // 2) 兜底：从 chunkSnapshotCache 扫描
+        for (const snap of chunkSnapshotCache.values()) {
+            if (snap && snap.text && snap.text.includes(`\\begin{${envName}}`)) {
+                collectRawLatexEnvsFromString(snap.text);
+            }
+        }
+        const updated = Array.from(rawLatexEnvBlocks);
+        for (let i = updated.length - 1; i >= 0; i--) {
+            if (checkMatch(updated[i])) {
+                return updated[i];
+            }
+        }
+        return null;
+    }
+
     // 从原始 JSON 文本中提取所有字符串字面量并解码为真实 Markdown
     const JSON_STR_RE = /"((?:[^"\\]|\\.)*)"/g;
     function collectFromJsonText(text, state) {
-        if (!text || typeof text !== 'string' || !text.includes('|')) return;
+        if (!text || typeof text !== 'string' || (!text.includes('|') && !text.includes('begin{'))) return;
         JSON_STR_RE.lastIndex = state ? state.pos || 0 : 0;
         let m;
         while ((m = JSON_STR_RE.exec(text)) !== null) {
+            const unescaped = jsonUnescape(m[1]);
+            if (unescaped.includes('begin{')) {
+                collectRawLatexEnvsFromString(unescaped);
+            }
             if (m[1].includes('|')) {
-                collectRawLinesFromString(jsonUnescape(m[1]));
+                collectRawLinesFromString(unescaped);
             }
             if (state) state.pos = JSON_STR_RE.lastIndex;
         }
@@ -1279,6 +1372,7 @@
                     const h = state.hiddenNodes[i];
                     h.node.style.display = h.prevDisplay;
                     h.node.removeAttribute('data-ms-math-hidden');
+                    delete h.node._msMathAbsorbed;
                 }
             }
             container._msMathState = null;
@@ -1307,6 +1401,11 @@
         }
 
         elements.forEach((el) => {
+            // 若当前元素已被标记为吸收隐藏（跨块公式后续部分），直接跳过
+            if (el.hasAttribute('data-ms-math-hidden') || el._msMathAbsorbed || (el.closest && el.closest('[data-ms-math-hidden]'))) {
+                return;
+            }
+
             // 若当前容器自身不是 p，但内部包含子级 p/li/blockquote 块元素，则让子级叶子容器独立处理，避免父容器重复处理与范围错位
             if (el.tagName.toLowerCase() !== 'p' && el.querySelector('p, li, blockquote')) {
                 return;
@@ -1391,6 +1490,17 @@
                             tokens.push({ type: 'br', node: child, text: '\n', start, end: virtualStr.length });
                             continue;
                         }
+                        if (tag === 'hr') {
+                            const start = virtualStr.length;
+                            virtualStr += '\n\\hline\n';
+                            tokens.push({ type: 'text', node: child, text: '\n\\hline\n', start, end: virtualStr.length });
+                            continue;
+                        }
+                        if (tag === 'li' && virtualStr.length > 0 && !virtualStr.endsWith('\n')) {
+                            const start = virtualStr.length;
+                            virtualStr += '\n';
+                            tokens.push({ type: 'text', node: child, text: '\n', start, end: virtualStr.length });
+                        }
 
                         const isItalic =
                             tag === 'em' ||
@@ -1438,20 +1548,79 @@
                 if (kind === 'begin') {
                     envStack.push({ name, start: envTok.index });
                 } else {
-                    if (envStack.length === 0 || envStack[envStack.length - 1].name !== name) {
-                        el._msMathRejectSig = null; // 流式未闭合，允许后续重试
-                        return; // 环境未闭合或嵌套不匹配
-                    }
-                    const opened = envStack.pop();
-                    if (envStack.length === 0 && supportedEnvs.has(name)) {
-                        topLevelEnvs.push({
-                            name,
-                            matchStart: opened.start,
-                            matchEnd: envTok.index + envTok[0].length
-                        });
+                    if (envStack.length > 0 && envStack[envStack.length - 1].name === name) {
+                        const opened = envStack.pop();
+                        if (envStack.length === 0 && supportedEnvs.has(name)) {
+                            topLevelEnvs.push({
+                                name,
+                                matchStart: opened.start,
+                                matchEnd: envTok.index + envTok[0].length
+                            });
+                        }
                     }
                 }
             }
+
+            const absorbedSiblings = [];
+            if (envStack.length > 0) {
+                // 跨兄弟块（Cross-Sibling Block）探测：检查是否被 CommonMark 列表/引用误劈裂到后续兄弟元素中
+                let nextSib = el.nextSibling;
+                let lookaheadCount = 0;
+                while (nextSib && lookaheadCount < 10 && envStack.length > 0) {
+                    if (nextSib.nodeType === 3) {
+                        if (!nextSib.nodeValue.trim()) {
+                            nextSib = nextSib.nextSibling;
+                            continue;
+                        }
+                    } else if (nextSib.nodeType === 8) {
+                        nextSib = nextSib.nextSibling;
+                        continue;
+                    } else if (nextSib.nodeType === 1) {
+                        lookaheadCount++;
+                        const sibTag = nextSib.tagName.toLowerCase();
+                        if (['script', 'style'].includes(sibTag)) {
+                            nextSib = nextSib.nextSibling;
+                            continue;
+                        }
+
+                        // 分隔符隔离
+                        const sepStart = virtualStr.length;
+                        virtualStr += '\n';
+                        tokens.push({ type: 'separator', node: null, text: '\n', start: sepStart, end: virtualStr.length });
+
+                        const sibScanStart = virtualStr.length;
+                        buildStream(nextSib);
+                        absorbedSiblings.push(nextSib);
+
+                        // 扫描新追加的兄弟内容能否闭合 envStack
+                        envTokenRe.lastIndex = sibScanStart;
+                        while ((envTok = envTokenRe.exec(virtualStr)) !== null) {
+                            const kind = envTok[1];
+                            const name = envTok[2];
+                            if (kind === 'begin') {
+                                envStack.push({ name, start: envTok.index });
+                            } else if (kind === 'end') {
+                                if (envStack.length > 0 && envStack[envStack.length - 1].name === name) {
+                                    const opened = envStack.pop();
+                                    if (envStack.length === 0 && supportedEnvs.has(name)) {
+                                        topLevelEnvs.push({
+                                            name,
+                                            matchStart: opened.start,
+                                            matchEnd: envTok.index + envTok[0].length
+                                        });
+                                    }
+                                }
+                            }
+                        }
+
+                        if (envStack.length === 0) {
+                            break;
+                        }
+                    }
+                    nextSib = nextSib.nextSibling;
+                }
+            }
+
             if (envStack.length !== 0 || topLevelEnvs.length === 0) {
                 el._msMathRejectSig = null; // 环境栈未闭合（流式进行中），允许后续重试
                 return;
@@ -1655,17 +1824,34 @@
             for (let i = 0; i < matchedRanges.length; i++) {
                 const r = matchedRanges[i];
                 let tex = '';
-                for (let tIdx = 0; tIdx < tokens.length; tIdx++) {
-                    const tk = tokens[tIdx];
-                    if (tk.end <= r.innerStart || tk.start >= r.innerEnd) continue;
-                    if (tk.type === 'katex') {
-                        tex += tk.rawTex || '';
-                    } else if (tk.type === 'text') {
-                        const s = Math.max(0, r.innerStart - tk.start);
-                        const e = Math.min(tk.text.length, r.innerEnd - tk.start);
-                        tex += tk.text.slice(s, e);
-                    } else if (tk.type !== 'opaque') {
-                        tex += tk.text;
+                let rawEnvFound = null;
+
+                // 优先从原始 LaTeX 环境缓存检索精准无损源码
+                const envName = (topLevelEnvs[0] && topLevelEnvs[0].name) || 'array';
+                const headSlice = virtualStr.slice(r.innerStart, Math.min(virtualStr.length, r.innerStart + 60));
+                const tailSlice = virtualStr.slice(Math.max(r.innerStart, r.innerEnd - 60), r.innerEnd);
+                rawEnvFound = findRawLatexEnvBlock(envName, headSlice, tailSlice);
+
+                if (rawEnvFound) {
+                    tex = rawEnvFound.replace(/^\$\$+|\$\$+$/g, '').trim();
+                } else {
+                    for (let tIdx = 0; tIdx < tokens.length; tIdx++) {
+                        const tk = tokens[tIdx];
+                        if (tk.end <= r.innerStart || tk.start >= r.innerEnd) continue;
+                        if (tk.type === 'katex') {
+                            tex += tk.rawTex || '';
+                        } else if (tk.type === 'text') {
+                            const s = Math.max(0, r.innerStart - tk.start);
+                            const e = Math.min(tk.text.length, r.innerEnd - tk.start);
+                            tex += tk.text.slice(s, e);
+                        } else if (tk.type !== 'opaque') {
+                            tex += tk.text;
+                        }
+                    }
+
+                    // 脱机 DOM 兜底：若由于 CommonMark 列表误判导致行首丢失了 '+ ' 或 '- '，进行智能补偿
+                    if (absorbedSiblings.length > 0) {
+                        tex = tex.replace(/(\\\s*(?:\r?\n)+)\s*(&\s*&?\s*[-+])/g, '$1+ $2');
                     }
                 }
 
@@ -1729,10 +1915,22 @@
                 }
             }
 
+            // 对跨块公式吸收的所有后续兄弟节点进行原位隐藏并打标记
+            for (let sIdx = 0; sIdx < absorbedSiblings.length; sIdx++) {
+                const sib = absorbedSiblings[sIdx];
+                hideElementInPlace(sib);
+                sib._msMathAbsorbed = true;
+            }
+
             const textEntries = [];
             for (let tIdx = 0; tIdx < tokens.length; tIdx++) {
                 const tk = tokens[tIdx];
                 if (tk.type !== 'text') continue;
+
+                // 若该文本节点属于被吸收的后续兄弟节点，跳过插入（兄弟节点已整块原位隐藏）
+                if (absorbedSiblings.length > 0 && !el.contains(tk.node)) {
+                    continue;
+                }
 
                 const overlapping = [];
                 for (let rIdx = 0; rIdx < validRanges.length; rIdx++) {
@@ -1799,8 +1997,17 @@
                 textEntries.push({ node: tk.node, rawVal: tk.text, fixedVal: '' });
             }
 
+            // 确保跨块公式即使在特殊文本分布下也能挂载入起始容器
+            for (let i = 0; i < validRanges.length; i++) {
+                const r = validRanges[i];
+                if (!r.inserted) {
+                    el.appendChild(r.mathEl);
+                    r.inserted = true;
+                }
+            }
+
             el._msMathRejectSig = null; // 修复成功，清除拒绝标记
-            el._msMathState = { textEntries, hiddenNodes, katexNodes };
+            el._msMathState = { textEntries, hiddenNodes, katexNodes, absorbedSiblings };
         });
     }
 

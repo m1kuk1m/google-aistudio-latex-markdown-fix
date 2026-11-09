@@ -26,6 +26,8 @@ When using Google AI Studio with models outputting complex mathematics and struc
    Fixes the rubber-band bounce-back issue on mobile browsers (such as Firefox Android) when panning across ultra-wide equations.
 7. **Literal Dollar Signs (`$` / Currency Amounts) Misrendered as Math**:
    When the model outputs dollar amounts (e.g., `($19.99/mo) and **Google AI Ultra** ($99.99/mo)`, `$2/$10`, etc.), the upstream Markdown engine can falsely pair them as inline math formulas, swallowing dollar signs, italicizing text, and breaking bold markdown. This script restores literal dollar amounts in place, seamlessly pairs trapped `**` markdown back to bold styles, and splits mixed currency/math expressions.
+8. **Cross-Block Formula Splitting by List Syntax (New in v1.5.0)**:
+   When multi-line LaTeX formulas (such as `\begin{array}` or `\begin{aligned}` in vertical arithmetic) have lines starting with `+ & ...` or `- & ...`, the upstream CommonMark parser mistakes them for unordered list items, forcefully splitting the formula across separate `<p>` and `<ul><li>` DOM blocks. This swallows the `+` sign into a list bullet and breaks rendering. This script implements an original LaTeX environment cache with cross-sibling DOM stitching to seamlessly reconstruct the formula and restore swallowed signs.
 
 ---
 
