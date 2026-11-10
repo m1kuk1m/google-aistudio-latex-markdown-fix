@@ -3,7 +3,7 @@
 // @name:zh-CN   Google AI Studio LaTeX 与 Markdown 修复
 // @name:ja      Google AI Studio 数式＆Markdownレンダリング修正
 // @namespace    https://github.com/m1kuk1m/google-aistudio-latex-markdown-fix
-// @version      1.6.0
+// @version      1.6.1
 // @description  Fixes LaTeX table cutoffs, broken matrix pipes, streaming race conditions, dollar currency math misrenderings, swallowed code blocks, broken tilde strikethroughs, biochemical star-bold splits, CJK punctuation formatting glitches, and cross-block formula splits in Google AI Studio.
 // @description:zh-CN 修复 Google AI Studio 上的 Markdown 表格公式截断、分块矩阵竖线丢失、流式输出覆盖、美元符号误渲染公式、列表代码块缩进吞噬、波浪号区间误变删除线、生化星号加粗误拆、CJK 标点斜体窃取排版及多行 LaTeX 公式跨块劈裂问题
 // @description:ja Google AI Studioにおける数式テーブルの途切れ、分割行列の縦線欠落、ストリーミング時の上書き、ドル記号の誤レンダリング、生化学アスタリスク分割、各種装飾の不具合、リスト構文による数式分断を修正します
@@ -23,13 +23,13 @@
     // 0. 环境桥接：安全获取真实页面 window 对象（兼容 Firefox Xray Vision 与各类油猴运行模式）
     const win = typeof unsafeWindow !== 'undefined' ? unsafeWindow : (typeof window !== 'undefined' ? window : globalThis);
 
-    // ==================== 1. 原始 Markdown/LaTeX 缓冲池与 Angular 状态层监听 (Data Stream & Memory Cache) ====================
-    // 背景与性能架构：
-    // AI Studio 使用 Angular NgRx/Signals 管理模型输出实体 (entities Map)。
-    // 本模块通过轻量监听 Map.prototype.set：
+    // ==================== 1. 原始 Markdown/LaTeX 缓冲池与只读数据流采集 (Data Stream & Memory Cache) ====================
+    // 背景与纯净架构：
+    // 本模块专注于纯视觉排版与 Markdown/LaTeX 渲染修复，对数据流进行 100% 只读监听，
+    // 彻底清除所有防撤回与防思考折叠残留代码，零状态污染、零实体字段篡改。
     //   1. 性能极速通道：克隆 Map 时对象引用相同则 O(1) 立即返回，无任何额外性能开销；
     //   2. 内存实时采集：直接从流式模型 chunk 提取完整 Markdown 表格行与 LaTeX 环境，
-    //      彻底消除昂贵的全网络流克隆与 12 层 Angular LView 递归反射；
+    //      彻底消除昂贵的全网络流克隆与多层递归反射；
     //   3. 内存快照缓存：维护 chunkSnapshotCache，供 findRawTableLine 与 findRawLatexEnvBlock 极速内存检索。
 
     // 影子快照池：记录 model 实体块的最新有效文本快照 (上限 2500 条)
@@ -42,66 +42,42 @@
         }
     }
 
-    // 原始 Markdown 缓冲池与 Angular LView 映射存储 (弱引用避免内存泄漏)
+    // 原始 Markdown 缓冲池
     const rawMarkdownLines = new Set();
-    const lViewMapRefs = [];
-    const seenMaps = new WeakSet();
 
-    // 钩子 E: 拦截 Map 原型 set 方法（记录 Angular LView 映射表与极速收集原始数据流）
+    // 钩子：轻量监听 Map 原型 set 方法（极速收集原始数据流中的表格行与 LaTeX 环境，100% 只读零污染）
     const hookMapPrototype = (targetMap) => {
         if (!targetMap || !targetMap.prototype) return;
         const origMapSet = targetMap.prototype.set;
 
-        // 拦截 set: 极速 O(1) 维护快照与原始 Markdown/LaTeX 数据流收集
         if (typeof origMapSet === 'function' && !targetMap.prototype._msHookedSet) {
             targetMap.prototype._msHookedSet = true;
             targetMap.prototype.set = function (k, v) {
-                // 1. Angular LView 映射表记录
-                if (typeof k === 'number' && Array.isArray(v) && v.length >= 10 && !seenMaps.has(this) && lViewMapRefs.length < 16) {
-                    seenMaps.add(this);
-                    if (typeof WeakRef !== 'undefined') {
-                        lViewMapRefs.push(new WeakRef(this));
-                    } else {
-                        lViewMapRefs.push({ deref: () => this });
-                    }
-                }
-
-                // 2. 渲染修复所需的数据流监听与极速缓存 (O(1) 性能极速通道)
                 try {
-                    if (v && typeof v === 'object' && v.role === 'model' && typeof k === 'string') {
-                        const prevSnapshot = chunkSnapshotCache.get(k);
+                    if (v && typeof v === 'object' && v.role === 'model' && typeof v.text === 'string' && typeof k === 'string') {
+                        const rawText = v.text;
+                        if (rawText.length > 0) {
+                            const prevSnapshot = chunkSnapshotCache.get(k);
 
-                        // 性能极速通道：new Map(entities) 克隆时引用相等则 O(1) 立即返回
-                        if (prevSnapshot && prevSnapshot.lastRef === v) {
-                            return origMapSet.call(this, k, v);
-                        }
+                            // 性能极速通道：引用相等则 O(1) 立即返回
+                            if (!prevSnapshot || prevSnapshot.lastRef !== v) {
+                                if (rawText.includes('|')) {
+                                    collectRawLinesFromString(rawText);
+                                }
+                                if (rawText.includes('begin{')) {
+                                    collectRawLatexEnvsFromString(rawText);
+                                }
 
-                        const rawText = typeof v.text === 'string' ? v.text : '';
-                        const hasSubstantiveText = rawText.length > 0;
-                        const isThoughtChunk = !!(v.thought || v.Ul || v.ln);
-
-                        // 实时收集 Markdown 表格行与原始完整 LaTeX 环境，消除昂贵的网络层流式克隆与深度反射
-                        if (rawText.includes('|')) {
-                            collectRawLinesFromString(rawText);
-                        }
-                        if (rawText.includes('begin{')) {
-                            collectRawLatexEnvsFromString(rawText);
-                        }
-
-                        if (hasSubstantiveText || isThoughtChunk) {
-                            // 保持最新最长文本快照 (供 findRawTableLine 与 findRawLatexEnvBlock 极速内存检索)
-                            const oldText = prevSnapshot ? prevSnapshot.text : '';
-                            const longest = rawText.length >= oldText.length ? rawText : oldText;
-                            chunkSnapshotCache.set(k, {
-                                id: k,
-                                role: 'model',
-                                thought: isThoughtChunk,
-                                text: longest,
-                                lastRef: v,
-                                timestamp: v.timestamp || Date.now(),
-                                lastSeen: Date.now()
-                            });
-                            cleanExpiredSnapshots();
+                                const oldText = prevSnapshot ? prevSnapshot.text : '';
+                                const longest = rawText.length >= oldText.length ? rawText : oldText;
+                                chunkSnapshotCache.set(k, {
+                                    id: k,
+                                    role: 'model',
+                                    text: longest,
+                                    lastRef: v
+                                });
+                                cleanExpiredSnapshots();
+                            }
                         }
                     }
                 } catch (_) {}
@@ -113,17 +89,6 @@
     hookMapPrototype(win.Map);
     if (typeof window !== 'undefined' && window !== win && window.Map) {
         hookMapPrototype(window.Map);
-    }
-
-    function getLViewById(id) {
-        for (let i = 0; i < lViewMapRefs.length; i++) {
-            const m = lViewMapRefs[i].deref();
-            if (m && typeof m.get === 'function') {
-                const v = m.get(id);
-                if (v) return v;
-            }
-        }
-        return null;
     }
 
     // 校验表格行中的公式与环境是否已完整闭合（防止流式半截行污染缓冲池）
@@ -275,20 +240,7 @@
 
     // ==================== 2. 全域网络与流式拦截器 (解决手机火狐无法捕获数据流的问题) ====================
 
-    // 保存底层原生的 TextDecoder.prototype.decode，供 fetch 内部调用，避免重复触发 Hook C
-    const rawDecode = (win.TextDecoder && win.TextDecoder.prototype && win.TextDecoder.prototype.decode)
-        ? win.TextDecoder.prototype.decode
-        : (typeof TextDecoder !== 'undefined' ? TextDecoder.prototype.decode : null);
-
-    // 钩子 A: 拦截 fetch (已由 Map.prototype.set 直接接管流式实体文本，无需耗费 CPU 进行全流 clone 与重复解码)
-    if (typeof win.fetch === 'function') {
-        const origFetch = win.fetch;
-        win.fetch = function (...args) {
-            return origFetch.apply(this, args);
-        };
-    }
-
-    // 钩子 B: 拦截 JSON.parse (轻量捕获一次性下发的 JSPB 数据，杜绝 25 层全对象树递归)
+    // 钩子 A: 拦截 JSON.parse (轻量捕获一次性下发的 JSPB 数据，杜绝 25 层全对象树递归)
     if (win.JSON && win.JSON.parse) {
         const origJSONParse = win.JSON.parse;
         win.JSON.parse = function () {
@@ -303,7 +255,7 @@
         };
     }
 
-    // 钩子 C: 拦截 TextDecoder (捕获流式文本解码)
+    // 钩子 B: 拦截 TextDecoder (捕获流式文本解码)
     if (win.TextDecoder) {
         const origDecode = win.TextDecoder.prototype.decode;
         win.TextDecoder.prototype.decode = function () {
@@ -318,7 +270,7 @@
         };
     }
 
-    // 钩子 D: 拦截 XMLHttpRequest (兜底其他旧版网络请求)
+    // 钩子 C: 拦截 XMLHttpRequest (兜底其他旧版网络请求)
     if (win.XMLHttpRequest) {
         const origSend = win.XMLHttpRequest.prototype.send;
         win.XMLHttpRequest.prototype.send = function () {
@@ -1595,7 +1547,6 @@
                         mEnd = lineEnd;
                     }
 
-                    const innerStr = virtualStr.slice(mStart, mEnd).replace(/^\$+|\$+$/g, '');
                     const leadDollars = (virtualStr.slice(mStart, mEnd).match(/^\$+/) || [''])[0].length;
                     const trailDollars = (virtualStr.slice(mStart, mEnd).match(/\$+$/) || [''])[0].length;
 

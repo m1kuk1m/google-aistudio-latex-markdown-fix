@@ -33,6 +33,10 @@ class MockNode {
         return null;
     }
 
+    get children() {
+        return this.childNodes.filter(c => c.nodeType === 1);
+    }
+
     get nextSibling() {
         if (!this.parentNode) return null;
         const idx = this.parentNode.childNodes.indexOf(this);
@@ -464,22 +468,28 @@ const scriptSource = fs.readFileSync(scriptPath, 'utf8');
 console.log('--- Test Suite 1: Script Header & Metadata Check ---');
 const versionMatch = scriptSource.match(/@version\s+([0-9.]+)/);
 assert.ok(versionMatch, 'Version header should exist');
-assert.strictEqual(versionMatch[1], '1.6.0', 'Version should be bumped to 1.6.0');
-console.log('✔ Version is correctly 1.6.0');
+assert.strictEqual(versionMatch[1], '1.6.1', 'Version should be bumped to 1.6.1');
+console.log('✔ Version is correctly 1.6.1');
 
 assert.ok(scriptSource.includes('fixBrokenCodeBlocks'), 'Script must define fixBrokenCodeBlocks');
 assert.ok(scriptSource.includes('fixBrokenTildeMarkdown'), 'Script must define fixBrokenTildeMarkdown');
 assert.ok(scriptSource.includes('fixBrokenBiochemicalStarBold'), 'Script must define fixBrokenBiochemicalStarBold');
 assert.ok(scriptSource.includes('fixBrokenCjkPunctuationBold'), 'Script must define fixBrokenCjkPunctuationBold');
+assert.ok(!scriptSource.includes('fixFragmentedModelTurns'), 'fixFragmentedModelTurns must be cleanly removed');
+assert.ok(!scriptSource.includes('stitchTurnIntoPrimary'), 'stitchTurnIntoPrimary must be cleanly removed');
 assert.ok(!scriptSource.includes('RETRACT_FINISH_REASONS'), 'RETRACT_FINISH_REASONS must be cleanly removed');
 assert.ok(!scriptSource.includes('_msHookedIncludes'), '_msHookedIncludes must be cleanly removed');
 assert.ok(!scriptSource.includes('recentlyDeletedModelChunks'), 'recentlyDeletedModelChunks must be cleanly removed');
 assert.ok(!scriptSource.includes('_msAntiRetraction'), '_msAntiRetraction flags must be cleanly removed');
 assert.ok(!scriptSource.includes('[防撤回保护生效]'), 'Retraction text injection must be cleanly removed');
 assert.ok(!scriptSource.includes('isUserInitiatedAction'), 'User action tracking must be cleanly removed');
+assert.ok(!scriptSource.includes('getLViewById'), 'getLViewById dead code must be cleanly removed');
+assert.ok(!scriptSource.includes('lViewMapRefs'), 'lViewMapRefs dead code must be cleanly removed');
+assert.ok(!scriptSource.includes('isThoughtChunk'), 'isThoughtChunk must be cleanly removed');
+assert.ok(!scriptSource.includes('rawDecode'), 'rawDecode dead code must be cleanly removed');
 assert.ok(scriptSource.includes('chunkSnapshotCache'), 'chunkSnapshotCache must be preserved for O(1) performance');
 assert.ok(scriptSource.includes('cleanExpiredSnapshots'), 'cleanExpiredSnapshots must be preserved');
-console.log('✔ Functions correctly named and anti-retraction completely removed\n');
+console.log('✔ Functions correctly named and anti-retraction / dead code completely removed\n');
 
 // Wrap script in an evaluator that exposes private functions for testing
 const wrappedSource = scriptSource.replace(
@@ -2312,6 +2322,150 @@ console.log('\n--- Test Suite 11: End-to-End Native Compatibility & Content Inte
     assert.strictEqual(normalChunk._msAntiRetractionRescued, undefined, 'No retraction modification');
 
     console.log('✔ Case 11.1 Passed: Native model stream output preserved with 100% integrity');
+}
+
+// ----------------------------------------------------
+console.log('\n--- Test Suite 12: Native Thought & Multi-Turn Zero-Tampering Guarantee ---');
+
+// 12.1 Native Thinking Model Isolation (Simulates 11.10 sample: User -> Thought -> Model Text)
+{
+    mockDoc.body.childNodes = [];
+    const session = mockDoc.createElement('div');
+    session.className = 'chat-session-content';
+    mockDoc.body.appendChild(session);
+
+    // Turn 0: User turn
+    const userTurn = mockDoc.createElement('ms-chat-turn');
+    userTurn.className = 'user';
+    const userP = mockDoc.createElement('p');
+    userP.textContent = '你的观点是什么';
+    userTurn.appendChild(userP);
+    session.appendChild(userTurn);
+
+    // Turn 1: Thought turn (thought-activity-host with ms-thought-chunk)
+    const thoughtTurn = mockDoc.createElement('ms-chat-turn');
+    thoughtTurn.className = 'text-chunk-host thought-activity-host ng-star-inserted';
+    const tc1 = mockDoc.createElement('div');
+    tc1.className = 'turn-content';
+    const thoughtChunk = mockDoc.createElement('ms-thought-chunk');
+    const thoughtCmark = mockDoc.createElement('ms-cmark-node');
+    const thoughtP = mockDoc.createElement('p');
+    thoughtP.textContent = 'Analyzing Current Implications... without endorsing either.';
+    thoughtCmark.appendChild(thoughtP);
+    thoughtChunk.appendChild(thoughtCmark);
+    tc1.appendChild(thoughtChunk);
+    thoughtTurn.appendChild(tc1);
+    session.appendChild(thoughtTurn);
+
+    // Turn 2: Model text response turn (text-chunk-host with actual answer)
+    const textTurn = mockDoc.createElement('ms-chat-turn');
+    textTurn.className = 'text-chunk-host ng-star-inserted';
+    const tc2 = mockDoc.createElement('div');
+    tc2.className = 'turn-content';
+    const textCmark = mockDoc.createElement('ms-cmark-node');
+    const textP = mockDoc.createElement('p');
+    textP.textContent = '作为人工智能，我没有个人的政治立场或主观观点。';
+    textCmark.appendChild(textP);
+    tc2.appendChild(textCmark);
+    textTurn.appendChild(tc2);
+    session.appendChild(textTurn);
+
+    runAllFixes();
+
+    // 1) Both turns must remain visible (display !== 'none')
+    assert.strictEqual(thoughtTurn.style.display, '', 'Thought turn must remain visible');
+    assert.strictEqual(textTurn.style.display, '', 'Model text turn must remain visible');
+
+    // 2) Neither turn has data-ms-stitched-turn attribute
+    assert.strictEqual(thoughtTurn.getAttribute('data-ms-stitched-turn'), null, 'Thought turn must not be marked stitched');
+    assert.strictEqual(textTurn.getAttribute('data-ms-stitched-turn'), null, 'Model text turn must not be marked stitched');
+
+    // 3) Thought turn content must NOT contain model text output
+    assert.ok(!thoughtTurn.textContent.includes('作为人工智能'), 'Thought turn must NEVER be contaminated with model output');
+    assert.ok(thoughtTurn.textContent.includes('Analyzing Current Implications'), 'Thought turn must retain its reasoning text');
+
+    // 4) Model text turn content must retain its original text intact
+    assert.ok(textTurn.textContent.includes('作为人工智能，我没有个人的政治立场或主观观点。'), 'Model text turn must preserve its answer');
+
+    console.log('✔ Case 12.1 Passed: Native thinking model card and answer card strictly isolated with zero cross-leakage');
+}
+
+// 12.2 Multi-Turn Conversational Boundary Protection
+{
+    mockDoc.body.childNodes = [];
+    const session = mockDoc.createElement('div');
+    session.className = 'chat-session-content';
+    mockDoc.body.appendChild(session);
+
+    // Round 1: User Q1 -> Model A1
+    const user1 = mockDoc.createElement('ms-chat-turn');
+    user1.className = 'user';
+    session.appendChild(user1);
+
+    const model1 = mockDoc.createElement('ms-chat-turn');
+    model1.className = 'model';
+    const cmark1 = mockDoc.createElement('ms-cmark-node');
+    const p1 = mockDoc.createElement('p');
+    p1.textContent = '这是第一轮回答。';
+    cmark1.appendChild(p1);
+    model1.appendChild(cmark1);
+    session.appendChild(model1);
+
+    // Round 2: User Q2 -> Model A2
+    const user2 = mockDoc.createElement('ms-chat-turn');
+    user2.className = 'user';
+    session.appendChild(user2);
+
+    const model2 = mockDoc.createElement('ms-chat-turn');
+    model2.className = 'model';
+    const cmark2 = mockDoc.createElement('ms-cmark-node');
+    const p2 = mockDoc.createElement('p');
+    p2.textContent = '这是第二轮回答。';
+    cmark2.appendChild(p2);
+    model2.appendChild(cmark2);
+    session.appendChild(model2);
+
+    runAllFixes();
+
+    assert.strictEqual(model1.style.display, '', 'Model 1 remains visible');
+    assert.strictEqual(model2.style.display, '', 'Model 2 remains visible');
+    assert.strictEqual(model1.textContent.includes('第二轮回答'), false, 'Model 1 must not contain Model 2 text');
+    assert.strictEqual(model2.textContent.includes('第一轮回答'), false, 'Model 2 must not contain Model 1 text');
+
+    console.log('✔ Case 12.2 Passed: Conversational turns across user questions strictly preserved and not merged');
+}
+
+// 12.3 Zero Card Merging & Zero DOM Reparenting Guarantee
+{
+    mockDoc.body.childNodes = [];
+    const session = mockDoc.createElement('div');
+    session.className = 'chat-session-content';
+    mockDoc.body.appendChild(session);
+
+    const turnA = mockDoc.createElement('ms-chat-turn');
+    turnA.className = 'model text-chunk-host';
+    const pA = mockDoc.createElement('p');
+    pA.textContent = '卡片 A 内容。';
+    turnA.appendChild(pA);
+    session.appendChild(turnA);
+
+    const turnB = mockDoc.createElement('ms-chat-turn');
+    turnB.className = 'model text-chunk-host';
+    const pB = mockDoc.createElement('p');
+    pB.textContent = '卡片 B 内容。';
+    turnB.appendChild(pB);
+    session.appendChild(turnB);
+
+    runAllFixes();
+
+    // Verify zero DOM reparenting: turnA and turnB remain direct children of session
+    assert.strictEqual(turnA.parentNode, session, 'Turn A remains direct child of session');
+    assert.strictEqual(turnB.parentNode, session, 'Turn B remains direct child of session');
+    assert.strictEqual(turnA.style.display, '', 'Turn A is visible');
+    assert.strictEqual(turnB.style.display, '', 'Turn B is visible');
+    assert.strictEqual(turnA.textContent.includes('卡片 B'), false, 'Turn A does not swallow Turn B');
+
+    console.log('✔ Case 12.3 Passed: Zero card merging and zero DOM reparenting strictly enforced');
 }
 
 console.log('\n=========================================');
